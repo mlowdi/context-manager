@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, ToolDefinition, LiveImagePolicy } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
 import type {
   ContextEntry,
@@ -10,22 +10,25 @@ import type {
 /**
  * Read-only view of the message store for strategies.
  */
-export interface MessageStoreView {
+export interface MessageStoreView<TBlock = ContentBlock> {
   /** Get all messages */
-  getAll(): StoredMessage[];
+  getAll(): StoredMessage<TBlock>[];
   /** Get a specific message */
-  get(id: MessageId): StoredMessage | null;
+  get(id: MessageId): StoredMessage<TBlock> | null;
   /** Get messages from a specific index */
-  getFrom(index: number): StoredMessage[];
+  getFrom(index: number): StoredMessage<TBlock>[];
   /** Get the last N messages */
-  getTail(count: number): StoredMessage[];
+  getTail(count: number): StoredMessage<TBlock>[];
   /** Get total message count */
   length(): number;
   /** Estimate tokens for a message */
-  estimateTokens(message: StoredMessage): number;
+  estimateTokens(message: StoredMessage<TBlock>): number;
   /** Closed-loop estimator calibration (optional — MessageStore provides it). */
   setTokenCalibration?(factor: number): void;
   getTokenCalibration?(): number;
+  /** Length-only sizing for necessary count/depth/budget candidates. Metadata
+   * selectors may inspect an uncached legacy blob, never encode/retain it. */
+  imageEncodedBytes?(hash: string): number | undefined;
   /**
    * Whether a message is under a compression hold (ContextManager
    * holdCompression / addMessage `holdCompression`). Compressing strategies
@@ -40,17 +43,17 @@ export interface MessageStoreView {
 /**
  * Read-only view of the context log for strategies.
  */
-export interface ContextLogView {
+export interface ContextLogView<TBlock = ContentBlock> {
   /** Get all entries */
-  getAll(): ContextEntry[];
+  getAll(): ContextEntry<TBlock>[];
   /** Get entries from a specific index */
-  getFrom(index: number): ContextEntry[];
+  getFrom(index: number): ContextEntry<TBlock>[];
   /** Get the last N entries */
-  getTail(count: number): ContextEntry[];
+  getTail(count: number): ContextEntry<TBlock>[];
   /** Get total entry count */
   length(): number;
   /** Estimate tokens for an entry */
-  estimateTokens(entry: ContextEntry): number;
+  estimateTokens(entry: ContextEntry<TBlock>): number;
 }
 
 /**
@@ -133,6 +136,9 @@ export interface ContextStrategy {
    *  tool results in-flight (yielding stream) and at storage time.
    *  0 or undefined = no limit. */
   readonly maxMessageTokens?: number;
+
+  /** The same image limits must govern live appends as compiled history. */
+  readonly liveImagePolicy?: LiveImagePolicy;
 
   /**
    * Initialize the strategy with context.

@@ -1,11 +1,12 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { ContentBlock } from '@animalabs/membrane';
+import { IMAGE_TOKEN_ESTIMATE, type ContentBlock } from '@animalabs/membrane';
 import type {
   MessageId,
   ContextEntry,
   ContextEntryInternal,
   SourceRelation,
   ContextLogView,
+  StoredContentBlock,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 import { MessageStore } from './message-store.js';
@@ -264,7 +265,7 @@ export class ContextLog {
   /**
    * Estimate tokens for an entry.
    */
-  estimateTokens(entry: ContextEntry): number {
+  estimateTokens(entry: ContextEntry<ContentBlock | StoredContentBlock>): number {
     let tokens = 0;
     for (const block of entry.content) {
       tokens += this.estimateBlockTokens(block);
@@ -272,7 +273,7 @@ export class ContextLog {
     return tokens;
   }
 
-  private estimateBlockTokens(block: ContentBlock): number {
+  private estimateBlockTokens(block: ContentBlock | StoredContentBlock): number {
     switch (block.type) {
       case 'text':
         return this.tokenEstimator(block.text);
@@ -308,7 +309,9 @@ export class ContextLog {
         }
         return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
       case 'image':
-        return block.tokenEstimate ?? 1600; // ~1568px image ≈ 1600 tokens (Anthropic)
+        return block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE;
+      case 'blob_ref':
+        return block.ref.originalType === 'image' ? block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE : 1000;
       case 'document':
       case 'audio':
       case 'video':
@@ -328,6 +331,19 @@ export class ContextLog {
       getTail: (count) => this.getTail(count),
       length: () => this.length(),
       estimateTokens: (entry) => this.estimateTokens(entry),
+    };
+  }
+
+  /** Honest unresolved content; no media/native blob is loaded. */
+  createMetadataView(): ContextLogView<StoredContentBlock> {
+    let all: ContextEntry<StoredContentBlock>[] | undefined;
+    const getAll = () => all ??= this.getAllInternal();
+    return {
+      getAll,
+      getFrom: index => getAll().slice(index),
+      getTail: count => getAll().slice(Math.max(0, getAll().length - count)),
+      length: () => this.length(),
+      estimateTokens: entry => this.estimateTokens(entry),
     };
   }
 

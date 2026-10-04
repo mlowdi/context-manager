@@ -64,15 +64,15 @@ export interface CompressionHoldInfo {
  * A message stored in the message store.
  * This is the source of truth for all conversation history.
  */
-export interface StoredMessage {
+export interface StoredMessage<TBlock = ContentBlock> {
   /** Unique message identifier */
   id: MessageId;
   /** Sequence number within current branch */
   sequence: Sequence;
   /** Participant name: "User", "Claude", "Alice", etc. */
   participant: string;
-  /** Message content blocks (uses Membrane types) */
-  content: ContentBlock[];
+  /** Resolved Membrane content by default; metadata views use stored references. */
+  content: TBlock[];
   /** Optional metadata */
   metadata?: MessageMetadata;
   /** When the message was stored */
@@ -128,6 +128,12 @@ export interface BlobReference {
   originalType: 'image' | 'document' | 'audio' | 'video';
 }
 
+/** Exact native JSON is archived separately from its media projection. */
+export interface NativeItemReference {
+  type: 'native-item-ref';
+  hash: string;
+}
+
 /**
  * Content block with blob references instead of inline data.
  * Used for storage efficiency.
@@ -137,8 +143,9 @@ export interface BlobReference {
  * - All other content types pass through unchanged
  */
 export type StoredContentBlock =
-  | Exclude<ContentBlock, { type: 'document' | 'audio' | 'video' }>
-  | { type: 'blob_ref'; ref: BlobReference };
+  | Exclude<ContentBlock, { type: 'document' | 'audio' | 'video' | 'tool_result' }>
+  | (Omit<Extract<ContentBlock, { type: 'tool_result' }>, 'content'> & { content: string | StoredContentBlock[] })
+  | { type: 'blob_ref'; ref: BlobReference; encodedBytes?: number; tokenEstimate?: number; sourceUrl?: string; rawItem?: unknown };
 
 /**
  * Internal representation of a stored message with blob references.

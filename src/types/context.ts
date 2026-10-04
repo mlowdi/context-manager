@@ -17,7 +17,7 @@ export type SourceRelation =
  * An entry in the context log.
  * The context log is a materialized, editable working set derived from the message store.
  */
-export interface ContextEntry {
+export interface ContextEntry<TBlock = ContentBlock> {
   /** Index in the context log */
   index: number;
   /** Source message ID (if derived from message store) */
@@ -29,12 +29,14 @@ export interface ContextEntry {
    * coverage invariant. Populate this wherever N entries collapse into one.
    */
   sourceMessageIds?: MessageId[];
+  /** Exact summaries represented by an emitted recall answer; selection-only. */
+  sourceSummaryIds?: string[];
   /** How this entry relates to its source */
   sourceRelation?: SourceRelation;
   /** Participant name */
   participant: string;
-  /** Materialized content blocks */
-  content: ContentBlock[];
+  /** Resolved blocks by default; metadata entries use unresolved references. */
+  content: TBlock[];
   /** For prompt caching (future) */
   cacheMarker?: boolean;
   /** Internal cache-layout identity when this entry ends one atomic rendered
@@ -124,6 +126,57 @@ export interface CompileResult {
    * Separated because the system prompt is outside context-manager's scope.
    */
   systemInjections: ContentBlock[];
+}
+
+/** Diagnostics only: NOT an inference-ready NormalizedMessage. */
+export interface MetadataContextMessage {
+  participant: string;
+  content: StoredContentBlock[];
+  sourceMessageId?: MessageId;
+  sourceMessageIds?: MessageId[];
+  cacheBreakpoint?: boolean;
+}
+
+export interface MetadataCompileResult {
+  messages: MetadataContextMessage[];
+  /** Snapshot calibration used to price this dry-run selection. */
+  tokenCalibration: number;
+  /** Post-policy selected content, priced with the store's calibrated estimator. */
+  estimatedTokens: number;
+}
+
+/** Opt-in diagnostic capture; ordinary metadata calls do not build provenance. */
+export interface MetadataCompileOptions {
+  provenance?: boolean;
+}
+
+/** Aligned with one normalized selected message, including split tool turns. */
+export interface MetadataEntryProvenance {
+  renderedTokens: number;
+  /** Raw leaf IDs, recursively expanded for summary answers. */
+  sourceMessageIds: MessageId[];
+  /** Exact represented summaries in emission order; empty for raw/scaffolding. */
+  sourceSummaryIds: string[];
+  /** Maximum represented summary level, or null for raw/scaffolding. */
+  summaryLevel: number | null;
+}
+
+/** An available referenced original, priced before selection filtering. */
+export interface MetadataSourceProvenance {
+  id: MessageId;
+  tokens: number;
+  timestamp: Date;
+}
+
+/** Data-only snapshot; no source views, estimators or original payloads escape. */
+export interface MetadataProvenance {
+  branch: Pick<BranchInfo, 'id' | 'name' | 'head'>;
+  entries: MetadataEntryProvenance[];
+  sources: MetadataSourceProvenance[];
+}
+
+export interface MetadataCompileResultWithProvenance extends MetadataCompileResult {
+  provenance: MetadataProvenance;
 }
 
 /**

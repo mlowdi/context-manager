@@ -10,6 +10,7 @@ export type {
   StoredMessage,
   BlobReference,
   StoredContentBlock,
+  NativeItemReference,
   StoredMessageInternal,
   MessageQuery,
   MessageQueryResult,
@@ -33,6 +34,13 @@ export type {
   BranchInfo,
   ContextInjection,
   CompileResult,
+  MetadataCompileResult,
+  MetadataCompileOptions,
+  MetadataCompileResultWithProvenance,
+  MetadataProvenance,
+  MetadataEntryProvenance,
+  MetadataSourceProvenance,
+  MetadataContextMessage,
 } from './context.js';
 
 // Strategy types
