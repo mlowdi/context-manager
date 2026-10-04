@@ -29,6 +29,8 @@ export interface ContextEntry<TBlock = ContentBlock> {
    * coverage invariant. Populate this wherever N entries collapse into one.
    */
   sourceMessageIds?: MessageId[];
+  /** Exact summaries represented by an emitted recall answer; selection-only. */
+  sourceSummaryIds?: string[];
   /** How this entry relates to its source */
   sourceRelation?: SourceRelation;
   /** Participant name */
@@ -141,6 +143,40 @@ export interface MetadataCompileResult {
   tokenCalibration: number;
   /** Post-policy selected content, priced with the store's calibrated estimator. */
   estimatedTokens: number;
+}
+
+/** Opt-in diagnostic capture; ordinary metadata calls do not build provenance. */
+export interface MetadataCompileOptions {
+  provenance?: boolean;
+}
+
+/** Aligned with one normalized selected message, including split tool turns. */
+export interface MetadataEntryProvenance {
+  renderedTokens: number;
+  /** Raw leaf IDs, recursively expanded for summary answers. */
+  sourceMessageIds: MessageId[];
+  /** Exact represented summaries in emission order; empty for raw/scaffolding. */
+  sourceSummaryIds: string[];
+  /** Maximum represented summary level, or null for raw/scaffolding. */
+  summaryLevel: number | null;
+}
+
+/** An available referenced original, priced before selection filtering. */
+export interface MetadataSourceProvenance {
+  id: MessageId;
+  tokens: number;
+  timestamp: Date;
+}
+
+/** Data-only snapshot; no source views, estimators or original payloads escape. */
+export interface MetadataProvenance {
+  branch: Pick<BranchInfo, 'id' | 'name' | 'head'>;
+  entries: MetadataEntryProvenance[];
+  sources: MetadataSourceProvenance[];
+}
+
+export interface MetadataCompileResultWithProvenance extends MetadataCompileResult {
+  provenance: MetadataProvenance;
 }
 
 /**

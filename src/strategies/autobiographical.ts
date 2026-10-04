@@ -4768,7 +4768,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(this._previewInFlight ? {} : { _lastPreview: this._lastPreview }),
       } : undefined;
       try {
-      const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+      const _diag = !opts?.dryRun && typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
       const _t0 = _diag ? Date.now() : 0;
       this.rebuildChunks(store, opts?.dryRun === true);
       if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
@@ -4781,7 +4781,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     // selectHierarchical commits nothing (no state-slot writes, no enqueue),
     // so it is already dry-run-safe and needs no gating.
-    return this.selectHierarchical(store, budget);
+    return this.selectHierarchical(store, budget, opts?.dryRun === true);
       } finally {
         if (saved) Object.assign(this, saved);
       }
@@ -5267,7 +5267,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Commit the accumulated stats as the last-render snapshot. */
-  protected rsEnd(): void {
+  protected rsEnd(logPlan = true): void {
     const r = this._rs;
     if (!r) return;
     r.pending = {
@@ -5303,15 +5303,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         moves: m?.moves ?? 0,
         ...(m?.solver !== undefined ? { solver: m.solver } : {}),
       };
-      // Loud only when the emitter OVERRUNS the plan — that is the direction
-      // that costs the tail. Under-spend is harmless slack.
-      const loud = delta > 0 && Math.abs(pct) >= 2;
-      const line =
-        `[plan-vs-actual] planned=${planned} actual=${actual} delta=${delta >= 0 ? '+' : ''}${delta}` +
-        ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) budgetMet=${m?.budgetMet} exhausted=${m?.exhausted}` +
-        ` moves=${m?.moves} solver=${m?.solver}`;
-      if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
-      else console.error(line);
+      if (logPlan) {
+        // Loud only when the emitter OVERRUNS the plan — that is the direction
+        // that costs the tail. Under-spend is harmless slack.
+        const loud = delta > 0 && Math.abs(pct) >= 2;
+        const line =
+          `[plan-vs-actual] planned=${planned} actual=${actual} delta=${delta >= 0 ? '+' : ''}${delta}` +
+          ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) budgetMet=${m?.budgetMet} exhausted=${m?.exhausted}` +
+          ` moves=${m?.moves} solver=${m?.solver}`;
+        if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
+        else console.error(line);
+      }
     }
     this._lastRenderStats = r;
     this._rs = null;
@@ -8143,7 +8145,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const rejectionBudget = Math.floor(maxTokens * (1 + overBudgetGraceRatio));
     // Closed-loop calibration: apply the persisted multiplier BEFORE any
     // estimate is taken this compile.
-    const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+    const _diag = !dryRun && typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     let _t = _diag ? Date.now() : 0;
     this.loadCalibration(store);
     const messages = store.getAll();
@@ -8468,7 +8470,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const prev = this.resolutions.get(id) ?? 0;
       if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
     }
-    if (plan?.override) {
+    if (!dryRun && plan?.override) {
       console.error(
         `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
           ` tokens=${plan.tokens} budget=${foldingBudget.totalBudget}` +
@@ -8690,6 +8692,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 index: entries.length + 1,
                 participant: summaryParticipant,
                 content: this.summaryAnswerContentCapped(ancestor, msgCap),
+                sourceSummaryIds: [ancestor.id],
                 sourceRelation: 'derived',
                 cacheLayoutKey: ancestor.id,
               };
@@ -8803,6 +8806,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           index: entries.length + 1,
           participant: summaryParticipant,
           content: this.summaryAnswerContentCapped(ancestor, msgCap),
+          sourceSummaryIds: [ancestor.id],
           sourceRelation: 'derived',
           cacheLayoutKey: ancestor.id,
         };
@@ -8916,7 +8920,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!dryRun && this.kvUnifiedReceiptSupersedePending && this.config.foldingStrategy !== 'kv-unified') {
       this.supersedeKvUnifiedReceipt();
     }
-    this.rsEnd();
+    this.rsEnd(!dryRun);
     if (dryRun && this._lastPreview) this._lastPreview.stats = this._lastRenderStats ?? undefined;
     // Closed-loop calibration bookkeeping: the committed render stats total
     // (in CURRENT calibrated units) is what this compile claims the request
@@ -9724,7 +9728,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Select context entries using hierarchical compression with budget carryover.
    * Matches moltbot's budget waterfall: L3 → L2 → L1 with unused budget flowing down.
    */
-  protected selectHierarchical(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
+  protected selectHierarchical(store: MessageStoreView, budget: TokenBudget, dryRun = false): ContextEntry[] {
     phaseChannel.report('context-build'); // liveness-watchdog phase
     this.rsBegin();
     const entries: ContextEntry[] = [];
@@ -10081,6 +10085,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               index: entries.length + 1,
               participant: summaryParticipant,
               content: this.summaryAnswerContentCapped(summary, msgCap),
+              sourceSummaryIds: [summary.id],
               sourceRelation: 'derived',
             };
             const pairTokens = this.recallPairCost(summary);
@@ -10164,6 +10169,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             index: entries.length + 1,
             participant: summaryParticipant,
             content: this.combinedRecallAnswerContent(selectedSummaries, msgCap),
+            sourceSummaryIds: selectedSummaries.map(summary => summary.id),
             sourceRelation: 'derived',
           };
 
@@ -10233,7 +10239,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Strip stale images before committing stats so RenderStats.total reflects
     // the post-strip context (this path places no cache markers).
     this.applyImageStripping(entries, store);
-    this.rsEnd();
+    this.rsEnd(!dryRun);
     return entries;
   }
 

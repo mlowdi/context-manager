@@ -26,6 +26,10 @@ import type {
   ContextInjection,
   CompileResult,
   MetadataCompileResult,
+  MetadataCompileOptions,
+  MetadataCompileResultWithProvenance,
+  MetadataEntryProvenance,
+  MetadataSourceProvenance,
   MetadataContextMessage,
   StoredContentBlock,
   MessageStoreView,
@@ -226,24 +230,20 @@ export class ContextManager {
     this.unsubscribeMessageStore = this.messageStore.addListener((event) => this.handleMessageStoreEvent(event));
   }
 
-  /**
-   * The strategy-facing message view — the single choke point through which
-   * every strategy read passes (compile, preview, render stats, and the
-   * tick/onNewMessage StrategyContext). Composition order: merge auxiliary
-   * slots into the timeline first, then apply the exclusion filter, so a
-   * filter sees (and can exclude from) the merged world.
-   */
-  private strategyMessageView(metadataOnly = false, knownBytes?: ReadonlyMap<string, number>,
-    inspectLegacyBytes?: (hash: string, cached?: number) => number) {
-    // The selector's legacy interface is normalized, but its shared policy and
-    // estimator also understand stored references. This adapter is private:
-    // only compileMetadata exposes these entries, with honest stored types.
+  /** Unfiltered own+auxiliary population, shared by selection and provenance. */
+  private mergedMessageView(metadataOnly = false, knownBytes?: ReadonlyMap<string, number>): MessageStoreView {
+    // The selector's legacy interface also understands unresolved references.
     const viewFor = (store: MessageStore): MessageStoreView => metadataOnly
       ? store.createMetadataView(knownBytes) as unknown as MessageStoreView : store.createView();
-    let view = mergeMessageStoreViews(
-      viewFor(this.messageStore),
-      this.auxiliaryStores.map(viewFor),
-    );
+    return mergeMessageStoreViews(viewFor(this.messageStore), this.auxiliaryStores.map(viewFor));
+  }
+
+  /** Single strategy-facing choke point: merge slots before boolean filtering.
+   * Metadata capture may reuse its underlying population for original lookup. */
+  private strategyMessageView(metadataOnly = false, knownBytes?: ReadonlyMap<string, number>,
+    inspectLegacyBytes?: (hash: string, cached?: number) => number,
+    underlyingView = this.mergedMessageView(metadataOnly, knownBytes)) {
+    let view = underlyingView;
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
@@ -1074,7 +1074,11 @@ export class ContextManager {
    * count/depth/budget candidates may inspect binary length once, including a
    * boundary candidate that remains summarized. No encoding/payload retention,
    * writes, compression or debug logging. Unrelated history is not resolved. */
-  async compileMetadata(budget: TokenBudget = { maxTokens: 100000, reserveForResponse: 4000 }): Promise<MetadataCompileResult> {
+  compileMetadata(budget: TokenBudget | undefined, options: { provenance: true }): Promise<MetadataCompileResultWithProvenance>;
+  compileMetadata(budget?: TokenBudget, options?: { provenance?: false }): Promise<MetadataCompileResult>;
+  compileMetadata(budget: TokenBudget | undefined, options: MetadataCompileOptions): Promise<MetadataCompileResult | MetadataCompileResultWithProvenance>;
+  async compileMetadata(budget: TokenBudget = { maxTokens: 100000, reserveForResponse: 4000 },
+    options?: MetadataCompileOptions): Promise<MetadataCompileResult | MetadataCompileResultWithProvenance> {
     // Strategies share the selector but receive an unresolved private adapter.
     const log = this.contextLog.createMetadataView() as unknown as ContextLogView;
     const knownBytes = new Map<string, number>();
@@ -1085,8 +1089,11 @@ export class ContextManager {
       knownBytes.set(hash, length);
       return length;
     } : undefined;
-    const view = this.strategyMessageView(true, knownBytes, inspectLegacyBytes);
+    const rawView = options?.provenance ? this.mergedMessageView(true, knownBytes) : undefined;
+    const branch = options?.provenance ? this.store.currentBranch() : undefined;
+    const view = this.strategyMessageView(true, knownBytes, inspectLegacyBytes, rawView);
     const entries = this.strategy.select(view, log, budget, { dryRun: true });
+    const calibration = view.getTokenCalibration?.() ?? this.messageStore.getTokenCalibration();
     const annotate = (blocks: StoredContentBlock[]): StoredContentBlock[] => {
       if (knownBytes.size === 0) return blocks;
       let result: StoredContentBlock[] | undefined;
@@ -1115,20 +1122,68 @@ export class ContextManager {
       return value;
     };
     const messages: MetadataContextMessage[] = [];
+    const provenanceEntries: MetadataEntryProvenance[] | undefined = rawView ? [] : undefined;
+    const sources: MetadataSourceProvenance[] | undefined = rawView ? [] : undefined;
+    const referenced = rawView ? new Set<MessageId>() : undefined;
+    const summaries = rawView ? new Map<string, SummaryEntry | null>() : undefined;
+    const summaryFor = summaries ? (id: string): SummaryEntry | null => {
+      if (!summaries.has(id)) summaries.set(id, this.getSummary(id));
+      return summaries.get(id)!;
+    } : undefined;
+    let estimatedTokens = 0;
     for (const entry of entries) {
+      let identity: Omit<MetadataEntryProvenance, 'renderedTokens'> | undefined;
+      if (rawView) {
+        const sourceSummaryIds = entry.sourceSummaryIds ?? [];
+        const leafIds = new Set(entry.sourceMessageIds ?? (entry.sourceMessageId ? [entry.sourceMessageId] : []));
+        let summaryLevel: number | null = null;
+        for (const id of sourceSummaryIds) {
+          const summary = summaryFor!(id);
+          if (summary) summaryLevel = Math.max(summaryLevel ?? 0, summary.level);
+        }
+        const pending = [...sourceSummaryIds].reverse();
+        const visited = new Set<string>();
+        while (pending.length) {
+          const id = pending.pop()!;
+          if (visited.has(id)) continue;
+          visited.add(id);
+          const summary = summaryFor!(id);
+          if (!summary) continue;
+          if (summary.sourceLevel === 0) {
+            for (const leaf of summary.sourceIds) leafIds.add(leaf);
+          } else {
+            for (let i = summary.sourceIds.length - 1; i >= 0; i--) pending.push(summary.sourceIds[i]);
+          }
+        }
+        for (const id of leafIds) {
+          if (referenced!.has(id)) continue;
+          referenced!.add(id);
+          // Point-read the UNFILTERED merged population, including originals
+          // excluded by the selection predicate but referenced by summaries.
+          const source = rawView.get(id);
+          if (source) sources!.push({ id, timestamp: new Date(source.timestamp),
+            tokens: this.messageStore.estimateContentTokens(source.content, calibration) });
+        }
+        identity = { sourceMessageIds: [...leafIds], sourceSummaryIds: [...sourceSummaryIds], summaryLevel };
+      }
       const parts = splitMixedToolMessages([{ participant: entry.participant, content: entry.content }]);
       for (let i = 0; i < parts.length; i++) {
         // The input came from metadata views; normalization only partitions it.
         const content = detach(annotate(parts[i].content as unknown as StoredContentBlock[]));
+        const renderedTokens = this.messageStore.estimateContentTokens(content, calibration);
+        estimatedTokens += renderedTokens;
         messages.push({ participant: parts[i].participant, content,
           ...(entry.sourceMessageId ? { sourceMessageId: entry.sourceMessageId } : {}),
           ...(entry.sourceMessageIds ? { sourceMessageIds: [...entry.sourceMessageIds] } : {}),
           ...(entry.cacheMarker && i === parts.length - 1 ? { cacheBreakpoint: true } : {}) });
+        if (identity) provenanceEntries!.push({ renderedTokens, summaryLevel: identity.summaryLevel,
+          sourceMessageIds: [...identity.sourceMessageIds], sourceSummaryIds: [...identity.sourceSummaryIds] });
       }
     }
-    const calibration = view.getTokenCalibration?.() ?? this.messageStore.getTokenCalibration();
-    return { messages, tokenCalibration: calibration, estimatedTokens: messages.reduce((sum, message) =>
-      sum + this.messageStore.estimateContentTokens(message.content, calibration), 0) };
+    const result: MetadataCompileResult = { messages, tokenCalibration: calibration, estimatedTokens };
+    if (!branch) return result;
+    return { ...result, provenance: { branch: { id: branch.id, name: branch.name, head: branch.head },
+      entries: provenanceEntries!, sources: sources! } };
   }
 
   /** Price normalized or unresolved content with an explicit snapshot calibration.

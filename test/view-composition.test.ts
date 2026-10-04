@@ -121,6 +121,36 @@ describe('ContextManager viewFilter', () => {
 });
 
 describe('ContextManager auxiliaryMessageViews', () => {
+  it('metadata snapshots shared and isolated own slots in Chronicle order without resolving nested media', async () => {
+    const main = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+    // Matches AgentFramework.createSubconsciousAgent's unchanged ownership/configuration.
+    const side = await ContextManager.open({ store: main.getStore(), namespace: 'subconscious/primary',
+      isolate: true, auxiliaryMessageViews: [{}], strategy: new WindowedPassthroughStrategy({
+        maxLiveImages: 1, maxLiveImageBytes: 1, imageStripDepthTokens: 100000,
+      }) });
+    try {
+      const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+      const call = main.addMessage('assistant', [{ type: 'tool_use', id: 'vision', name: 'inspect', input: {} }]);
+      const own = side.addMessage('Subconscious', text('own between shared messages'));
+      const result = main.addMessage('user', [{ type: 'tool_result', toolUseId: 'vision', content: [
+        ...text('auxiliary original'), { type: 'image', tokenEstimate: 941,
+          source: { type: 'base64', mediaType: 'image/png', data: png } },
+      ] }]);
+      const primary = main.getMessageWindow(0, main.getMessageCount(), { resolveBlobs: false }).messages;
+      const raw = primary.find(message => message.id === result)!;
+      const store = main.getStore();
+      const sequence = store.currentSequence();
+      store.getBlob = () => { throw new Error('metadata resolved a subconscious archive'); };
+      const snapshot = await side.compileMetadata({ maxTokens: 20000, reserveForResponse: 0 }, { provenance: true });
+      assert.deepEqual(snapshot.provenance.entries.flatMap(row => row.sourceMessageIds), [call, own, result]);
+      assert.deepEqual(snapshot.provenance.sources.map(row => row.id), [call, own, result]);
+      assert.equal(snapshot.provenance.sources[2].tokens, side.estimateContentTokens(raw.content, snapshot.tokenCalibration));
+      assert.ok(snapshot.provenance.entries[2].renderedTokens < snapshot.provenance.sources[2].tokens);
+      assert.equal(side.getMessageCount(), 1, 'the shared originals remain auxiliary, not copied into own slot');
+      assert.ok(!JSON.stringify(snapshot).includes(png));
+      assert.equal(store.currentSequence(), sequence);
+    } finally { side.close(); main.close(); }
+  });
   it('merges another slot into the strategy view, ordered by sequence', async () => {
     const path = freshPath();
     // Main writes the shared un-namespaced slot.

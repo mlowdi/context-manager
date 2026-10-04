@@ -32,6 +32,35 @@ afterEach(() => {
 });
 
 describe('ContextManager branch lifecycle regressions', () => {
+  it('metadata holds source prices/dates and branch identity through edits and same-name recreation', async () => {
+    const manager = await ContextManager.open({ path: storePath(), strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('user', content('old selected content'));
+      const main = manager.currentBranch().name;
+      await manager.fork('curve-side');
+      const budget = { maxTokens: 20000, reserveForResponse: 0 };
+      const pending = manager.compileMetadata(budget, { provenance: true });
+      // The capture is synchronous even though its public API returns a promise.
+      manager.editMessage(id, content('new content '.repeat(100)));
+      const old = await pending;
+      assert.equal(old.messages[0].content[0].type, 'text');
+      assert.deepEqual(old.messages[0].content, content('old selected content'));
+      const date = manager.getMessage(id)!.timestamp;
+      assert.deepEqual(old.provenance.sources[0].timestamp, date);
+      const changed = await manager.compileMetadata(budget, { provenance: true });
+      assert.notEqual(changed.provenance.sources[0].tokens, old.provenance.sources[0].tokens);
+      assert.notEqual(changed.provenance.branch.head, old.provenance.branch.head);
+      await manager.switchBranch(main);
+      manager.getStore().deleteBranch('curve-side');
+      manager.getStore().createBranch('curve-side');
+      await manager.switchBranch('curve-side');
+      const recreated = await manager.compileMetadata(budget, { provenance: true });
+      assert.equal(recreated.provenance.branch.name, old.provenance.branch.name);
+      assert.notEqual(recreated.provenance.branch.id, old.provenance.branch.id);
+      assert.deepEqual(recreated.messages[0].content, content('old selected content'));
+      assert.notStrictEqual(recreated.provenance.sources[0].timestamp, old.provenance.sources[0].timestamp);
+    } finally { manager.close(); }
+  });
   it('branchAt keeps every message through the selected message after a sibling mutation', async () => {
     const manager = await ContextManager.open({
       path: storePath(),

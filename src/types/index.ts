@@ -35,6 +35,11 @@ export type {
   ContextInjection,
   CompileResult,
   MetadataCompileResult,
+  MetadataCompileOptions,
+  MetadataCompileResultWithProvenance,
+  MetadataProvenance,
+  MetadataEntryProvenance,
+  MetadataSourceProvenance,
   MetadataContextMessage,
 } from './context.js';
 

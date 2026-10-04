@@ -71,6 +71,11 @@ export type {
   CompileResult,
   MetadataContextMessage,
   MetadataCompileResult,
+  MetadataCompileOptions,
+  MetadataCompileResultWithProvenance,
+  MetadataProvenance,
+  MetadataEntryProvenance,
+  MetadataSourceProvenance,
   // Strategy types
   MessageStoreView,
   ContextLogView,

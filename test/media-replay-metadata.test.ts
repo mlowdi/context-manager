@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { ContextManager, AutobiographicalStrategy, WindowedPassthroughStrategy, MessageStore, jsonTokenEstimator } from '../src/index.js';
 import { JsStore } from '@animalabs/chronicle';
 import { OpenAIResponsesFormatter, projectResponsesItem, type ContentBlock } from '@animalabs/membrane';
-import type { StoredContentBlock, StoredMessageInternal, SummaryEntry } from '../src/types/index.js';
+import type { StoredContentBlock, StoredMessageInternal, SummaryEntry, ContextEntry, MetadataCompileResultWithProvenance } from '../src/types/index.js';
 
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 const GIF = 'R0lGODdhAQABAIEAAP///wAAAAAAAAAAACwAAAAAAQABAAAIBAABBAQAOw==';
@@ -431,14 +431,20 @@ test('snapshot costing preserves custom text, fixed signed/media prices and per-
     for (const calibration of [0.6, 1.7]) {
       store.setStateJson('diagnostic-fixture/autobio:calibration', { multiplier: calibration });
       const sequence = store.currentSequence();
-      const metadata = await cm.compileMetadata(budget);
+      const metadata = await cm.compileMetadata(budget, { provenance: true });
       const expected = rawCosts.reduce((sum, price) => sum + Math.round(price * calibration), 0);
+      assert.equal(metadata.provenance.entries.length, metadata.messages.length);
+      assert.equal(metadata.provenance.entries.reduce((sum, row) => sum + row.renderedTokens, 0), metadata.estimatedTokens);
+      assert.equal(metadata.provenance.sources.length, 1, 'split turns reference one original row');
+      assert.equal(metadata.provenance.sources[0].tokens, expected, 'original prices preserve top-level rounding boundaries');
+      metadata.provenance.entries.forEach((row, i) => assert.equal(row.renderedTokens,
+        cm.estimateContentTokens(metadata.messages[i].content, calibration)));
       assert.equal(metadata.tokenCalibration, calibration);
       assert.equal(cm.estimateContentTokens(content, metadata.tokenCalibration), expected);
       assert.equal(metadata.messages.reduce((sum, message) =>
         sum + cm.estimateContentTokens(message.content, metadata.tokenCalibration), 0), metadata.estimatedTokens,
         'selected layout is priced canonically, including its rendered partition boundaries');
-      assert.deepEqual(await cm.compileMetadata(budget), metadata);
+      assert.deepEqual(await cm.compileMetadata(budget, { provenance: true }), metadata);
       assert.equal(liveEstimate(content), liveBefore);
       assert.deepEqual(cm.getRenderStats(), stats);
       assert.equal(store.currentSequence(), sequence, 'pure pricing cannot register indexes or persist state');
@@ -558,6 +564,209 @@ test('closing a manager detaches its strategy listener without closing the calle
     assert.ok(store.currentSequence() > before);
     assert.equal(notifications, 1, 'the released manager cannot run its old strategy after disposal');
   } finally { cm.close(); store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const solver of ['default', 'kv-stable'] as const) {
+  test(`metadata diagnostics stay silent while ordinary compiles retain reports (${solver})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-silent-metadata-'));
+    const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new AutobiographicalStrategy({
+      headWindowTokens: 0, recentWindowTokens: 100000, targetChunkTokens: 100000,
+      adaptiveResolution: true, autoTickOnNewMessage: false,
+      ...(solver === 'kv-stable' ? { foldingStrategy: 'kv-stable' as const } : {}),
+    }) });
+    const error = console.error;
+    const warn = console.warn;
+    const lines: unknown[][] = [];
+    try {
+      console.error = (...args) => { lines.push(args); };
+      console.warn = (...args) => { lines.push(args); };
+      // Empty carried frontier deterministically takes kv-stable's bootstrap
+      // override; exercise that REAL solver before any ordinary compile.
+      await cm.compileMetadata(budget);
+      await cm.compileMetadata(budget, { provenance: true });
+      assert.equal(lines.length, 0);
+      if (solver === 'kv-stable') {
+        await cm.compile(budget);
+        assert.ok(lines.some(args => String(args[0]).startsWith('[kv-escalation] override=bootstrap')),
+          'ordinary bootstrap must still report the same override');
+      }
+      cm.addMessage('user', [text('diagnostic source')]);
+      lines.length = 0;
+      await cm.compileMetadata(budget);
+      await cm.compileMetadata(budget, { provenance: true });
+      assert.equal(lines.length, 0);
+      await cm.compile(budget);
+      assert.ok(lines.some(args => String(args[0]).startsWith('[plan-vs-actual]')));
+    } finally { console.error = error; console.warn = warn; cm.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+class ProvenanceStrategy extends AutobiographicalStrategy {
+  seedSummary(entry: SummaryEntry): void { this.pushSummary(entry); }
+}
+
+for (const mode of ['adaptive', 'positioned', 'combined'] as const) {
+  test(`metadata captures exact selected summary identities and leaves (${mode})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-summary-provenance-'));
+    const strategy = new ProvenanceStrategy({ headWindowTokens: 0, recentWindowTokens: 8,
+      targetChunkTokens: 100000, autoTickOnNewMessage: false, adaptiveResolution: mode === 'adaptive',
+      positionedRecallPairs: mode !== 'combined', recallHeaderTemplate: 'Identical custom header',
+      summaryContextLabel: 'Identical custom header', maxLiveImages: 1, maxLiveImageBytes: 1,
+      imageStripDepthTokens: 100000 });
+    const cm = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    try {
+      const ids = [0, 1, 2, 3].map(i => cm.addMessage('user', [text(('raw-' + i + ' ').repeat(180))]));
+      cm.addMessage('user', [text('latest ' + 'Z'.repeat(60))]);
+      const seed = (id: string, level: number, sourceLevel: number, sourceIds: string[], range: string[],
+        extra: Partial<SummaryEntry> = {}) => strategy.seedSummary({ id, level, sourceLevel, sourceIds,
+        sourceRange: { first: range[0], last: range.at(-1)! }, created: 0,
+        content: 'Same prefix '.repeat(12) + id, tokens: 45, ...extra });
+      seed('L1-0', 1, 0, [ids[0]], [ids[0]], { mergedInto: 'L2-100', parentId: 'L2-100' });
+      seed('L1-1', 1, 0, [ids[1]], [ids[1]], { mergedInto: 'L2-100', parentId: 'L2-100' });
+      seed('L2-100', 2, 1, ['L1-0', 'L1-1'], ids.slice(0, 2));
+      seed('L1-101', 1, 0, [ids[2]], [ids[2]]);
+      seed('L1-102', 1, 0, [ids[3]], [ids[3]]);
+      const selectedBudget = { maxTokens: mode === 'adaptive' ? 600 : 20000, reserveForResponse: 0 };
+      const store = cm.getStore();
+      const sequence = store.currentSequence();
+      const stats = cm.getRenderStats();
+      const pending = cm.getPendingWork();
+      store.getBlob = () => { throw new Error('summary provenance loaded a blob'); };
+      const plain = await cm.compileMetadata(selectedBudget);
+      assert.deepEqual(Object.keys(plain).sort(), ['estimatedTokens', 'messages', 'tokenCalibration']);
+      assert.ok(plain.messages.every(message => !('sourceSummaryIds' in message)));
+      const captured: MetadataCompileResultWithProvenance = await cm.compileMetadata(selectedBudget, { provenance: true });
+      assert.deepEqual(captured.messages, plain.messages);
+      assert.equal(captured.estimatedTokens, plain.estimatedTokens);
+      const answers = captured.provenance.entries.filter(row => row.sourceSummaryIds.length);
+      assert.ok(answers.length > 0, 'real selector must emit recall answers');
+      if (mode === 'combined') {
+        assert.equal(answers.length, 1);
+        assert.deepEqual(answers[0].sourceSummaryIds, ['L2-100', 'L1-101', 'L1-102']);
+        assert.deepEqual(answers[0].sourceMessageIds, ids);
+        assert.equal(answers[0].summaryLevel, 2);
+      } else {
+        assert.deepEqual(answers.map(row => row.sourceSummaryIds[0]), mode === 'adaptive'
+          ? ['L2-100', 'L1-101'] : ['L2-100', 'L1-101', 'L1-102']);
+        assert.deepEqual(answers[0].sourceMessageIds, ids.slice(0, 2));
+      }
+      captured.messages.forEach((message, i) => {
+        if (message.participant === 'Context Manager') {
+          assert.deepEqual(captured.provenance.entries[i].sourceSummaryIds, []);
+          assert.deepEqual(captured.provenance.entries[i].sourceMessageIds, []);
+          assert.equal(captured.provenance.entries[i].summaryLevel, null);
+        }
+      });
+      assert.equal(captured.provenance.entries.reduce((sum, row) => sum + row.renderedTokens, 0), captured.estimatedTokens);
+      const original = JSON.stringify(captured);
+      captured.provenance.branch.name = 'caller mutation';
+      captured.provenance.sources[0].timestamp.setTime(0);
+      answers[0].sourceMessageIds.push('caller mutation');
+      answers[0].sourceSummaryIds.push('caller mutation');
+      assert.equal(JSON.stringify(await cm.compileMetadata(selectedBudget, { provenance: true })), original);
+      assert.equal(store.currentSequence(), sequence);
+      assert.deepEqual(cm.getRenderStats(), stats);
+      assert.deepEqual(cm.getPendingWork(), pending);
+    } finally { cm.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test('adaptive grouped-shard recall answers retain all original leaf identities', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cm-shard-summary-provenance-'));
+  const strategy = new ProvenanceStrategy({ headWindowTokens: 0, recentWindowTokens: 8,
+    targetChunkTokens: 200, adaptiveResolution: true, autoTickOnNewMessage: false });
+  const cm = await ContextManager.open({ path: join(dir, 'store'), strategy });
+  try {
+    cm.addMessage('User', [text('paragraph. '.repeat(1000))]);
+    const shards = cm.getMessageWindow(0, cm.getMessageCount(), { resolveBlobs: false }).messages;
+    assert.ok(shards.length > 1 && shards.every(message => message.bodyGroupId === shards[0].bodyGroupId));
+    const ids = shards.map(message => message.id);
+    cm.addMessage('User', [text('latest ' + 'Z'.repeat(60))]);
+    strategy.seedSummary({ id: 'L1-shards', level: 1, sourceLevel: 0, sourceIds: ids, created: 0,
+      content: 'one summary for the whole body group', tokens: 10, sourceRange: { first: ids[0], last: ids.at(-1)! } });
+    const store = cm.getStore();
+    const sequence = store.currentSequence();
+    store.getBlob = () => { throw new Error('shard provenance resolved an archive'); };
+    const snapshot = await cm.compileMetadata({ maxTokens: 600, reserveForResponse: 0 }, { provenance: true });
+    const answers = snapshot.provenance.entries.filter(row => row.sourceSummaryIds.includes('L1-shards'));
+    assert.equal(answers.length, 1, 'the actual body-group answer is emitted once');
+    assert.deepEqual(answers[0].sourceMessageIds, ids);
+    assert.equal(snapshot.provenance.sources.filter(row => ids.includes(row.id)).length, ids.length);
+    assert.equal(store.currentSequence(), sequence);
+  } finally { cm.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('summary provenance prices unfiltered auxiliary originals even when selection excludes their raw messages', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cm-filtered-summary-originals-'));
+  const writer = await ContextManager.open({ path: join(dir, 'store'), strategy: new WindowedPassthroughStrategy() });
+  const strategy = new ProvenanceStrategy({ headWindowTokens: 0, recentWindowTokens: 8,
+    adaptiveResolution: false, autoTickOnNewMessage: false, maxLiveImages: 1, maxLiveImageBytes: 1,
+    imageStripDepthTokens: 100000 });
+  const reader = await ContextManager.open({ store: writer.getStore(), namespace: 'subconscious/filtered',
+    isolate: true, auxiliaryMessageViews: [{}], viewFilter: message => message.participant !== 'Excluded', strategy });
+  try {
+    const visible = writer.addMessage('user', [text('visible older history '.repeat(50))]);
+    const excluded = writer.addMessage('Excluded', [text('excluded original'), image(941)]);
+    reader.addMessage('Subconscious', [text('latest ' + 'Z'.repeat(60))]);
+    strategy.seedSummary({ id: 'L1-aux', level: 1, sourceLevel: 0, sourceIds: [visible, excluded], created: 0,
+      content: 'auxiliary summary', tokens: 6, sourceRange: { first: visible, last: excluded }, mergedInto: 'L2-aux' });
+    strategy.seedSummary({ id: 'L2-aux', level: 2, sourceLevel: 1, sourceIds: ['L1-aux'], created: 0,
+      content: 'nested auxiliary summary', tokens: 8, sourceRange: { first: visible, last: excluded } });
+    const originals = writer.getMessageWindow(0, writer.getMessageCount(), { resolveBlobs: false }).messages;
+    const store = writer.getStore();
+    const sequence = store.currentSequence();
+    store.getBlob = () => { throw new Error('filtered provenance opened an image'); };
+    const plain = await reader.compileMetadata(budget);
+    const captured = await reader.compileMetadata(budget, { provenance: true });
+    assert.deepEqual(captured.messages, plain.messages, 'capture does not change exclusion/selection');
+    assert.ok(captured.messages.every(message => message.sourceMessageId !== excluded));
+    const answer = captured.provenance.entries.find(row => row.sourceSummaryIds.includes('L2-aux'));
+    assert.ok(answer, 'real hierarchical selection represents the nested auxiliary summary');
+    assert.deepEqual(answer.sourceMessageIds, [visible, excluded]);
+    const excludedRow = captured.provenance.sources.find(row => row.id === excluded)!;
+    assert.equal(excludedRow.tokens, reader.estimateContentTokens(originals.find(message => message.id === excluded)!.content,
+      captured.tokenCalibration));
+    assert.ok(excludedRow.tokens > 941);
+    assert.ok(!JSON.stringify(captured).includes(PNG));
+    assert.equal(store.currentSequence(), sequence);
+  } finally { reader.close(); writer.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('provenance expands cyclic forests once and prices each normalized part/original once', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cm-cyclic-provenance-'));
+  class SelectedForest extends ProvenanceStrategy {
+    override select(): ContextEntry[] {
+      return [{ index: 0, participant: 'root', sourceSummaryIds: ['L2-root', 'L1-leaf'],
+        content: [text('summary answer')] }];
+    }
+  }
+  const strategy = new SelectedForest({ autoTickOnNewMessage: false });
+  const cm = await ContextManager.open({ path: join(dir, 'store'), strategy });
+  try {
+    const id = cm.addMessage('user', [text('original')]);
+    const seed = (summaryId: string, level: number, sourceLevel: number, sourceIds: string[]) =>
+      strategy.seedSummary({ id: summaryId, level, sourceLevel, sourceIds, created: 0,
+        content: summaryId, tokens: 4, sourceRange: { first: id, last: id } });
+    seed('L1-leaf', 1, 0, [id, id, 'genuinely-unavailable']);
+    seed('L2-root', 2, 1, ['L2-cycle', 'L1-leaf', 'missing-summary']);
+    seed('L2-cycle', 2, 1, ['L2-root', 'L1-leaf']);
+    // Instrument the existing owned store; constructing a second store would register indexes.
+    const diagnosticManager = cm as unknown as { messageStore: MessageStore };
+    const owned = diagnosticManager.messageStore;
+    const estimate = owned.estimateContentTokens.bind(owned);
+    let prices = 0;
+    owned.estimateContentTokens = (blocks, calibration) => { prices++; return estimate(blocks, calibration); };
+    const plain = await cm.compileMetadata(budget);
+    assert.equal(prices, 1, 'default metadata prices selected content only');
+    prices = 0;
+    const captured = await cm.compileMetadata(budget, { provenance: true });
+    assert.equal(prices, 2, 'one rendered part plus one available referenced original');
+    assert.deepEqual(captured.messages, plain.messages);
+    assert.deepEqual(captured.provenance.entries[0].sourceMessageIds, [id, 'genuinely-unavailable']);
+    assert.deepEqual(captured.provenance.sources.map(row => row.id), [id]);
+    assert.deepEqual(Object.keys(captured.provenance.sources[0]).sort(), ['id', 'timestamp', 'tokens']);
+    assert.equal(captured.provenance.entries[0].summaryLevel, 2);
+  } finally { cm.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('windowed strategy uses the same nested image policy in metadata and inference compilation', async () => {
