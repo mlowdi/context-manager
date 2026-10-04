@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import { IMAGE_TOKEN_ESTIMATE, type ContentBlock } from '@animalabs/membrane';
+import { IMAGE_TOKEN_ESTIMATE, isImageReference, type ContentBlock } from '@animalabs/membrane';
 import type {
   MessageId,
   ContextEntry,
@@ -309,9 +309,10 @@ export class ContextLog {
         }
         return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
       case 'image':
+      case 'generated_image':
         return block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE;
       case 'blob_ref':
-        return block.ref.originalType === 'image' ? block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE : 1000;
+        return isImageReference(block) ? block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE : 1000;
       case 'document':
       case 'audio':
       case 'video':
@@ -337,7 +338,10 @@ export class ContextLog {
   /** Honest unresolved content; no media/native blob is loaded. */
   createMetadataView(): ContextLogView<StoredContentBlock> {
     let all: ContextEntry<StoredContentBlock>[] | undefined;
-    const getAll = () => all ??= this.getAllInternal();
+    const getAll = () => all ??= this.getAllInternal().map(entry => {
+      const content = this.blobManager.metadataContent(entry.content);
+      return content === entry.content ? entry : { ...entry, content };
+    });
     return {
       getAll,
       getFrom: index => getAll().slice(index),

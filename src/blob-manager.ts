@@ -2,12 +2,13 @@ import type { JsStore } from '@animalabs/chronicle';
 import type {
   ContentBlock,
   ImageContent,
+  GeneratedImageContent,
   DocumentContent,
   AudioContent,
   VideoContent,
   Base64Source,
 } from '@animalabs/membrane';
-import { normalizeImageContent } from '@animalabs/membrane';
+import { normalizeImageContent, isVisualImageContent, isGeneratedImageMetadata } from '@animalabs/membrane';
 import type { BlobReference, StoredContentBlock, NativeItemReference } from './types/index.js';
 
 /** Detect provider-supported raster image types from their byte signature.
@@ -129,6 +130,38 @@ export class BlobManager {
     });
   }
 
+  /** Read-only legacy projection. No migration, fake hash, blob read or write:
+   * payloads remain in the original record for explicit resolved replay. */
+  metadataContent(content: StoredContentBlock[]): StoredContentBlock[] {
+    let result: StoredContentBlock[] | undefined;
+    for (let index = 0; index < content.length; index++) {
+      const block = content[index];
+      let next = block;
+      if (block.type === 'generated_image' && !isGeneratedImageMetadata(block)) {
+        const visual = normalizeImageContent(block as unknown as Record<string, unknown>);
+        if (!isVisualImageContent(visual) || visual.type !== 'generated_image') next = visual as StoredContentBlock;
+        else {
+          const { data, rawItem, ...attributes } = visual;
+          const nativeRef = rawItem && typeof rawItem === 'object' && 'type' in rawItem && rawItem.type === 'native-item-ref';
+          next = { ...attributes, metadataOnly: true, encodedBytes: data.length,
+            ...(nativeRef ? { rawItem } : {}) };
+        }
+      } else if (block.type === 'tool_result' && Array.isArray(block.content)) {
+        const nested = this.metadataContent(block.content);
+        if (nested !== block.content) next = { ...block, content: nested };
+      }
+      if (next !== block) { result ??= content.slice(); result[index] = next; }
+    }
+    return result ?? content;
+  }
+
+  /** Legacy native generation payloads are opaque in diagnostics too. */
+  metadataNativeItem(item: unknown): unknown {
+    if (!item || typeof item !== 'object' || !('type' in item) || item.type !== 'image_generation_call') return item;
+    const { result: _result, ...metadata } = item as Record<string, unknown>;
+    return metadata;
+  }
+
   private nativeReferences = new WeakMap<object, NativeItemReference>();
 
   extractNativeItem(item: object): NativeItemReference {
@@ -169,6 +202,8 @@ export class BlobManager {
     switch (block.type) {
       case 'image':
         return this.extractFromImage(block);
+      case 'generated_image':
+        return this.extractFromGeneratedImage(block);
       case 'document':
         return this.extractFromDocument(block);
       case 'audio':
@@ -200,6 +235,14 @@ export class BlobManager {
     return { ...attributes, type: 'blob_ref', ref, encodedBytes: image.source.data.length };
   }
 
+  private extractFromGeneratedImage(block: GeneratedImageContent): StoredContentBlock {
+    const image = normalizeImageContent(block as unknown as Record<string, unknown>);
+    if (image.type !== 'generated_image') return image as StoredContentBlock;
+    const ref = this.storeBase64({ type: 'base64', data: image.data, mediaType: image.mimeType }, 'generated_image');
+    const { data: _data, mimeType: _mimeType, type: _type, ...attributes } = image;
+    return { ...attributes, type: 'blob_ref', ref, encodedBytes: image.data.length };
+  }
+
   private extractFromDocument(block: DocumentContent): StoredContentBlock {
     const ref = this.storeBase64(block.source, 'document');
     return { type: 'blob_ref', ref };
@@ -224,7 +267,7 @@ export class BlobManager {
     // image label otherwise survives in BlobReference and causes permanent
     // provider 400s every time the message is rendered. Canonicalize only
     // raster formats with unambiguous signatures; preserve unknown types.
-    const mediaType = originalType === 'image'
+    const mediaType = (originalType === 'image' || originalType === 'generated_image')
       ? sniffRasterImageMediaType(buffer) ?? source.mediaType
       : source.mediaType;
     const hash = this.store.storeBlob(buffer, mediaType);
@@ -257,7 +300,7 @@ export class BlobManager {
       // Repair legacy references on read as well as new ingress on write.
       // This changes only the provider-facing MIME label, never blob bytes or
       // persisted source state.
-      mediaType: ref.originalType === 'image'
+      mediaType: (ref.originalType === 'image' || ref.originalType === 'generated_image')
         ? canonicalImageMediaTypeFromBase64(data, ref.mediaType)
         : ref.mediaType,
     };
@@ -265,6 +308,8 @@ export class BlobManager {
     switch (ref.originalType) {
       case 'image':
         return { ...attributes, type: 'image', source } as ImageContent;
+      case 'generated_image':
+        return { ...attributes, type: 'generated_image', data, mimeType: source.mediaType } as GeneratedImageContent;
       case 'document':
         return { type: 'document', source } as DocumentContent;
       case 'audio':
@@ -281,6 +326,8 @@ export class BlobManager {
     switch (block.type) {
       case 'image':
         return block.source.type === 'base64';
+      case 'generated_image':
+        return true;
       case 'document':
       case 'audio':
       case 'video':
@@ -300,6 +347,8 @@ export class BlobManager {
           return Math.ceil(block.source.data.length * 0.75); // base64 -> bytes
         }
         return 0;
+      case 'generated_image':
+        return Math.ceil(block.data.length * 0.75);
       case 'document':
       case 'audio':
       case 'video':

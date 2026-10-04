@@ -1283,9 +1283,18 @@ export class ContextManager {
       ) => PreviewResult;
     };
     if (typeof s.previewContext !== 'function') return null;
+    // The rendered preview is diagnostic metadata, never an inference request.
+    // Reuse compileMetadata's unresolved view and lazy legacy-length seam.
+    const knownBytes = new Map<string, number>();
+    const inspectLegacyBytes = (hash: string, cached?: number): number => {
+      const length = cached ?? this.messageStore.inspectLegacyImageEncodedBytes(hash);
+      knownBytes.set(hash, length);
+      return length;
+    };
+    const log = this.contextLog.createMetadataView() as unknown as ContextLogView;
     return s.previewContext(
-      this.strategyMessageView(),
-      this.contextLog.createView(),
+      this.strategyMessageView(true, knownBytes, inspectLegacyBytes),
+      log,
       budget,
       overrides,
       opts,

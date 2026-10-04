@@ -1,4 +1,4 @@
-import type { ContentBlock } from '@animalabs/membrane';
+import type { ContentBlock, GeneratedImageMetadata } from '@animalabs/membrane';
 
 /**
  * Unique identifier for a message in the store.
@@ -125,7 +125,7 @@ export interface BlobReference {
   /** MIME type of the content */
   mediaType: string;
   /** Original content block type */
-  originalType: 'image' | 'document' | 'audio' | 'video';
+  originalType: 'image' | 'generated_image' | 'document' | 'audio' | 'video';
 }
 
 /** Exact native JSON is archived separately from its media projection. */
@@ -143,9 +143,10 @@ export interface NativeItemReference {
  * - All other content types pass through unchanged
  */
 export type StoredContentBlock =
+  | GeneratedImageMetadata
   | Exclude<ContentBlock, { type: 'document' | 'audio' | 'video' | 'tool_result' }>
   | (Omit<Extract<ContentBlock, { type: 'tool_result' }>, 'content'> & { content: string | StoredContentBlock[] })
-  | { type: 'blob_ref'; ref: BlobReference; encodedBytes?: number; tokenEstimate?: number; sourceUrl?: string; rawItem?: unknown };
+  | { type: 'blob_ref'; ref: BlobReference; encodedBytes?: number; tokenEstimate?: number; sourceUrl?: string; isPreview?: boolean; rawItem?: unknown };
 
 /**
  * Internal representation of a stored message with blob references.

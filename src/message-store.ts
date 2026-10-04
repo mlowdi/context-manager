@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import { IMAGE_TOKEN_ESTIMATE, projectResponsesItem, type ContentBlock } from '@animalabs/membrane';
+import { IMAGE_TOKEN_ESTIMATE, projectResponsesItem, isImageReference, type ContentBlock } from '@animalabs/membrane';
 import type {
   MessageId,
   Sequence,
@@ -979,9 +979,10 @@ export class MessageStore {
         }
         return 0;
       case 'image':
+      case 'generated_image':
         return block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE;
       case 'blob_ref':
-        return block.ref.originalType === 'image' ? block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE : 1000;
+        return isImageReference(block) ? block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE : 1000;
       case 'document':
       case 'audio':
       case 'video':
@@ -1007,6 +1008,17 @@ export class MessageStore {
     };
   }
 
+  private metadataOnlyMetadata(metadata: MessageMetadata | undefined): MessageMetadata | undefined {
+    const native = metadata?.openaiResponsesItems;
+    if (!Array.isArray(native)) return metadata;
+    let projected: unknown[] | undefined;
+    for (let index = 0; index < native.length; index++) {
+      const item = this.blobManager.metadataNativeItem(native[index]);
+      if (item !== native[index]) { projected ??= native.slice(); projected[index] = item; }
+    }
+    return projected ? { ...metadata, openaiResponsesItems: projected } : metadata;
+  }
+
   /** Inspect one necessary legacy count/depth/budget candidate's length. */
   inspectLegacyImageEncodedBytes(hash: string): number {
     return this.blobManager.imageEncodedByteLength(hash, true)!;
@@ -1017,7 +1029,8 @@ export class MessageStore {
     let calibration = this.tokenCalibration;
     let all: StoredMessage<StoredContentBlock>[] | undefined;
     const map = (internal: StoredMessageInternal): StoredMessage<StoredContentBlock> =>
-      ({ ...internal, timestamp: new Date(internal.timestamp) });
+      ({ ...internal, content: this.blobManager.metadataContent(internal.content),
+        metadata: this.metadataOnlyMetadata(internal.metadata), timestamp: new Date(internal.timestamp) });
     const getAll = () => all ??= this.getAllInternal().map(map);
     return {
       getAll,
@@ -1752,7 +1765,7 @@ export class MessageStore {
     const native = internal.metadata?.openaiResponsesItems;
     const metadata = resolveBlobs && Array.isArray(native)
       ? { ...internal.metadata, openaiResponsesItems: native.map(item => this.blobManager.resolveNativeItem(item, nativeCache)) }
-      : internal.metadata;
+      : resolveBlobs ? internal.metadata : this.metadataOnlyMetadata(internal.metadata);
     const stored: StoredMessage = {
       id,
       // chronicle record sequence captured when the message was appended
@@ -1773,7 +1786,7 @@ export class MessageStore {
       // distinction; the public metadata compile exposes StoredContentBlock[].
       content: resolveBlobs
         ? this.blobManager.resolveBlobs(internal.content, nativeCache)
-        : (internal.content as unknown as ContentBlock[]),
+        : (this.blobManager.metadataContent(internal.content) as unknown as ContentBlock[]),
       metadata,
       timestamp: new Date(internal.timestamp),
       causedBy: internal.causedBy,

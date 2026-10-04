@@ -2,7 +2,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import {
   NativeFormatter, filterImageMessages, createImageMessageFilter, projectNativeImageContent, imageDepthStart,
-  DEFAULT_MAX_LIVE_IMAGE_BYTES, type LiveImagePolicy,
+  DEFAULT_MAX_LIVE_IMAGE_BYTES, isVisualImageContent, isImageReference, hasVisualImageContent, estimateImagePolicyContentTokens, type LiveImagePolicy,
 } from '@animalabs/membrane';
 import { phaseChannel } from '../phase-channel.js';
 import type {
@@ -9573,15 +9573,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           break;
         }
         case 'tool_result': {
-          const n =
-            typeof b.content === 'string'
-              ? b.content.length
+          const n = typeof b.content === 'string' ? b.content.length
+            : Array.isArray(b.content) && hasVisualImageContent(b.content)
+              ? estimateImagePolicyContentTokens(b.content as ContentBlock[]) * 4
               : JSON.stringify(b.content ?? '').length;
           totalChars += n;
           externalChars += n;
           break;
         }
-        case 'image': {
+        case 'image':
+        case 'generated_image': {
           // Estimate parity with the renderer's flat image cost; the payload
           // lives in the file/CDN, so it is fully externalized.
           totalChars += 6400; // ≈1600 tokens × 4 chars
@@ -11531,7 +11532,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           lines.push(`[Tool: ${block.name}]`);
         } else if (block.type === 'tool_result') {
           lines.push(`[Tool Result]`);
-        } else if (block.type === 'image') {
+        } else if (isVisualImageContent(block) || isImageReference(block)) {
           lines.push(`[Image]`);
         }
       }
