@@ -1,0 +1,1 @@
+- Plain `previewContext` results once again omit previewed `stats`; `{ render: true }` retains the requested entries and segment stats. The public projection uses one detached output object and leaves every plan field, infeasible-budget result, solver decision and dry-run/live-state restoration unchanged.

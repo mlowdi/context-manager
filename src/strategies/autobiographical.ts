@@ -1469,7 +1469,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Segment breakdown for the hypothetical compile, captured BEFORE the
       // finally block restores the live one. Lets a caller show the previewed
       // head/middle/tail split without re-deriving it.
-      return {
+      const result = {
         ...preview,
         // Read _lastRenderStats, not _rs: select() has already committed and
         // nulled _rs by this point.
@@ -1477,6 +1477,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? { entries: rendered, stats: preview.stats ?? this._lastRenderStats ?? undefined }
           : {}),
       };
+      if (!opts?.render) delete result.stats;
+      return result;
     } finally {
       this.config = savedConfig;
       this._adaptivePicker = savedPicker;

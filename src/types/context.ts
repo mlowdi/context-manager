@@ -137,6 +137,8 @@ export interface MetadataContextMessage {
 
 export interface MetadataCompileResult {
   messages: MetadataContextMessage[];
+  /** Snapshot calibration used to price this dry-run selection. */
+  tokenCalibration: number;
   /** Post-policy selected content, priced with the store's calibrated estimator. */
   estimatedTokens: number;
 }

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ContextManager, AutobiographicalStrategy, WindowedPassthroughStrategy, MessageStore } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, WindowedPassthroughStrategy, MessageStore, jsonTokenEstimator } from '../src/index.js';
 import { JsStore } from '@animalabs/chronicle';
 import { OpenAIResponsesFormatter, projectResponsesItem, type ContentBlock } from '@animalabs/membrane';
 import type { StoredContentBlock, StoredMessageInternal, SummaryEntry } from '../src/types/index.js';
@@ -386,13 +386,74 @@ test('metadata uses persisted calibration without changing the next live append 
     const stats = cm.getRenderStats();
     const sequence = store.currentSequence();
     const metadata = await cm.compileMetadata(budget);
-    assert.equal(metadata.estimatedTokens, Math.round(before * 1.7));
+    assert.equal(metadata.tokenCalibration, 1.7);
+    assert.equal(metadata.estimatedTokens, 235);
+    assert.equal(cm.estimateContentTokens([text('x'.repeat(400))], metadata.tokenCalibration), metadata.estimatedTokens);
+    assert.deepEqual(await cm.compileMetadata(budget), metadata, 'repeated reads keep the same isolated snapshot');
     assert.equal(estimate([text('x'.repeat(400))]), before, 'a panel read cannot change live tool-round pricing');
     assert.deepEqual(cm.getRenderStats(), stats, 'read-only selection cannot publish a new render state');
     assert.equal(store.currentSequence(), sequence);
     const compiled = await cm.compile(budget);
     assert.equal(estimate(compiled.messages.flatMap(message => message.content)), metadata.estimatedTokens,
       'ordinary compilation still adopts the persisted calibration when it actually runs');
+  } finally { cm.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('snapshot costing preserves custom text, fixed signed/media prices and per-block rounding without live mutation', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cm-snapshot-costing-'));
+  const cm = await ContextManager.open({
+    path: join(dir, 'store'), namespace: 'diagnostic-fixture', tokenEstimator: value => value.length + 3,
+    strategy: new AutobiographicalStrategy({ adaptiveResolution: true, autoTickOnNewMessage: false,
+      headWindowTokens: 0, recentWindowTokens: 100000, targetChunkTokens: 100000,
+      maxLiveImages: 10, maxLiveImageBytes: 0, imageStripDepthTokens: 0 }),
+  });
+  const content: ContentBlock[] = [
+    text('a'), text('b'),
+    { type: 'tool_use', id: 'nested', name: 'inspect', input: {} },
+    { type: 'tool_result', toolUseId: 'nested', content: [text('a'), image(4)] },
+    { type: 'thinking', thinking: '', signature: 's'.repeat(3300) },
+    { type: 'thinking', thinking: 'not the billed price', signature: 's'.repeat(3300), tokenEstimate: 7 } as ContentBlock,
+    { type: 'redacted_thinking', data: '', tokenEstimate: 9 } as ContentBlock,
+    image(0), image(731),
+  ];
+  // The tool-result's children form one priced top-level block. Rounding its
+  // aggregate is deliberately different from rounding each nested child.
+  const rawCosts = [4, 4, jsonTokenEstimator('{}') + 20, 8, 1000, 7, 9, 0, 731];
+  try {
+    cm.addMessage('root', content);
+    const store = cm.getStore();
+    const getBlob = store.getBlob.bind(store);
+    store.getBlob = () => { throw new Error('snapshot costing opened a blob'); };
+    const liveEstimate = cm.getLiveImagePolicy()!.estimateTokens!;
+    const liveBefore = liveEstimate(content);
+    const stats = cm.getRenderStats();
+    const snapshots = [];
+    for (const calibration of [0.6, 1.7]) {
+      store.setStateJson('diagnostic-fixture/autobio:calibration', { multiplier: calibration });
+      const sequence = store.currentSequence();
+      const metadata = await cm.compileMetadata(budget);
+      const expected = rawCosts.reduce((sum, price) => sum + Math.round(price * calibration), 0);
+      assert.equal(metadata.tokenCalibration, calibration);
+      assert.equal(cm.estimateContentTokens(content, metadata.tokenCalibration), expected);
+      assert.equal(metadata.messages.reduce((sum, message) =>
+        sum + cm.estimateContentTokens(message.content, metadata.tokenCalibration), 0), metadata.estimatedTokens,
+        'selected layout is priced canonically, including its rendered partition boundaries');
+      assert.deepEqual(await cm.compileMetadata(budget), metadata);
+      assert.equal(liveEstimate(content), liveBefore);
+      assert.deepEqual(cm.getRenderStats(), stats);
+      assert.equal(store.currentSequence(), sequence, 'pure pricing cannot register indexes or persist state');
+      snapshots.push(metadata);
+    }
+    assert.equal(snapshots[0].tokenCalibration, 0.6, 'a later read does not mutate earlier snapshot calibration');
+    assert.equal(cm.estimateContentTokens(content, snapshots[0].tokenCalibration),
+      rawCosts.reduce((sum, price) => sum + Math.round(price * 0.6), 0),
+      'the old snapshot stays usable after persisted calibration changes');
+    // Ordinary compile may resolve selected media; permit the existing resolver
+    // only after all zero-read snapshot checks have completed.
+    store.getBlob = getBlob;
+    const compiled = await cm.compile(budget);
+    assert.equal(liveEstimate(compiled.messages.flatMap(message => message.content)), snapshots[1].estimatedTokens,
+      'only ordinary compile adopts the latest persisted calibration');
   } finally { cm.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

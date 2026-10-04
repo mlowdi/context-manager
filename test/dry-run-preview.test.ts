@@ -281,6 +281,8 @@ describe('AutobiographicalStrategy — dry-run preview', () => {
     const plain = manager.previewContext(budget)!;
     assert.strictEqual(plain.entries, undefined, 'entries are opt-in (they can be megabytes)');
     assert.strictEqual(plain.stats, undefined, 'previewed stats are opt-in too');
+    assert.strictEqual(Object.hasOwn(plain, 'stats'), false, 'plain projection omits the stats field');
+    assert.deepStrictEqual(manager.previewContext(budget, undefined, { render: false }), plain);
 
     const withRender = manager.previewContext(budget, undefined, { render: true })!;
     assert.ok(Array.isArray(withRender.entries), 'render:true must return the rendered entries');
@@ -288,6 +290,10 @@ describe('AutobiographicalStrategy — dry-run preview', () => {
     assert.ok(withRender.stats, 'render:true must return the previewed segment stats');
     // Same plan either way — rendering must not change the outcome.
     assert.strictEqual(withRender.finalTokens, plain.finalTokens, 'render must not alter the plan');
+    const renderedPlan = { ...withRender };
+    delete renderedPlan.entries;
+    delete renderedPlan.stats;
+    assert.deepStrictEqual(renderedPlan, plain, 'render projection preserves every plan field');
   });
 
   it('a real compile after a preview still commits normally', async () => {

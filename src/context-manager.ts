@@ -1127,8 +1127,14 @@ export class ContextManager {
       }
     }
     const calibration = view.getTokenCalibration?.() ?? this.messageStore.getTokenCalibration();
-    return { messages, estimatedTokens: messages.reduce((sum, message) =>
+    return { messages, tokenCalibration: calibration, estimatedTokens: messages.reduce((sum, message) =>
       sum + this.messageStore.estimateContentTokens(message.content, calibration), 0) };
+  }
+
+  /** Price normalized or unresolved content with an explicit snapshot calibration.
+   * Uses the owned store's canonical estimator without changing live pricing. */
+  estimateContentTokens(content: readonly (ContentBlock | StoredContentBlock)[], calibration: number): number {
+    return this.messageStore.estimateContentTokens(content, calibration);
   }
 
   /**
