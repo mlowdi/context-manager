@@ -1,11 +1,12 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { ContentBlock } from '@animalabs/membrane';
+import { IMAGE_TOKEN_ESTIMATE, projectResponsesItem, type ContentBlock } from '@animalabs/membrane';
 import type {
   MessageId,
   Sequence,
   MessageMetadata,
   StoredMessage,
   StoredMessageInternal,
+  StoredContentBlock,
   MessageStoreView,
   MessageQuery,
   MessageQueryResult,
@@ -406,13 +407,22 @@ export class MessageStore {
       lockedByAgent?: boolean;
     }
   ): StoredMessage {
+    // Keep imported native metadata as audit testimony, but also materialize
+    // typed carriers so selection/compression cannot lose its images.
+    const native = metadata?.openaiResponsesItems;
+    if (Array.isArray(native)) content = native.flatMap(item => item && typeof item === 'object'
+      ? projectResponsesItem(item as Record<string, unknown>) : []);
     // Extract blobs from content
     const storedContent = this.blobManager.extractBlobs(content);
+    const storedMetadata = Array.isArray(native)
+      ? { ...metadata, openaiResponsesItems: native.map(item => item && typeof item === 'object'
+        ? this.blobManager.extractNativeItem(item) : item) }
+      : metadata;
 
     const partialInternal = {
       participant,
       content: storedContent,
-      metadata,
+      metadata: storedMetadata,
       timestamp: Date.now(),
       causedBy,
       ...(extra ?? {}),
@@ -825,11 +835,14 @@ export class MessageStore {
   /**
    * Estimate tokens for a message.
    */
-  estimateTokens(message: StoredMessage): number {
+  estimateTokens(message: StoredMessage<ContentBlock | StoredContentBlock>): number {
+    return this.estimateContentTokens(message.content);
+  }
+
+  /** Shared with live appends so depth uses this store's calibrated prices. */
+  estimateContentTokens(content: readonly (ContentBlock | StoredContentBlock)[], calibration = this.tokenCalibration): number {
     let tokens = 0;
-    for (const block of message.content) {
-      tokens += this.estimateBlockTokens(block);
-    }
+    for (const block of content) tokens += this.estimateBlockTokens(block, calibration);
     return tokens;
   }
 
@@ -899,10 +912,10 @@ export class MessageStore {
   static readonly ENCRYPTED_CARRIER_CHARS_PER_TOKEN = 6;
 
   /** Per-block cache of the raw (calibration-independent) estimate. */
-  private _rawBlockTokens = new WeakMap<ContentBlock, number>();
+  private _rawBlockTokens = new WeakMap<ContentBlock | StoredContentBlock, number>();
 
-  private estimateBlockTokens(block: ContentBlock): number {
-    return Math.round(this.estimateBlockTokensRaw(block) * this.tokenCalibration);
+  private estimateBlockTokens(block: ContentBlock | StoredContentBlock, calibration: number): number {
+    return Math.round(this.estimateBlockTokensRaw(block) * calibration);
   }
 
   /** Cached wrapper for the raw per-block estimate. Keyed on the block object:
@@ -913,7 +926,7 @@ export class MessageStore {
    *  estimateBlockTokens, so cached raw values survive calibration changes.
    *  Removes the repeated JSON.stringify(tool_use.input) / tool_result content
    *  walks that dominated moves:0 compiles at scale (Sol, 2026-07-31). */
-  private estimateBlockTokensRaw(block: ContentBlock): number {
+  private estimateBlockTokensRaw(block: ContentBlock | StoredContentBlock): number {
     const cached = this._rawBlockTokens.get(block);
     if (cached !== undefined) return cached;
     const raw = this.computeBlockTokensRaw(block);
@@ -921,7 +934,7 @@ export class MessageStore {
     return raw;
   }
 
-  private computeBlockTokensRaw(block: ContentBlock): number {
+  private computeBlockTokensRaw(block: ContentBlock | StoredContentBlock): number {
     switch (block.type) {
       case 'text':
         return this.tokenEstimator(block.text);
@@ -966,7 +979,9 @@ export class MessageStore {
         }
         return 0;
       case 'image':
-        return block.tokenEstimate ?? 1600; // ~1568px image ≈ 1600 tokens (Anthropic)
+        return block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE;
+      case 'blob_ref':
+        return block.ref.originalType === 'image' ? block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE : 1000;
       case 'document':
       case 'audio':
       case 'video':
@@ -989,6 +1004,37 @@ export class MessageStore {
       setTokenCalibration: (f: number) => this.setTokenCalibration(f),
       getTokenCalibration: () => this.getTokenCalibration(),
       estimateTokens: (msg) => this.estimateTokens(msg),
+    };
+  }
+
+  /** Inspect one necessary legacy count/depth/budget candidate's length. */
+  inspectLegacyImageEncodedBytes(hash: string): number {
+    return this.blobManager.imageEncodedByteLength(hash, true)!;
+  }
+
+  /** Unresolved, immutable content for read-only selection. Never loads a blob. */
+  createMetadataView(knownBytes?: ReadonlyMap<string, number>): MessageStoreView<StoredContentBlock> {
+    let calibration = this.tokenCalibration;
+    let all: StoredMessage<StoredContentBlock>[] | undefined;
+    const map = (internal: StoredMessageInternal): StoredMessage<StoredContentBlock> =>
+      ({ ...internal, timestamp: new Date(internal.timestamp) });
+    const getAll = () => all ??= this.getAllInternal().map(map);
+    return {
+      getAll,
+      get: id => {
+        const index = this.lookupIndex(id);
+        const internal = index === undefined ? null : this.getInternal(index);
+        return internal ? map(internal) : null;
+      },
+      getFrom: index => getAll().slice(index),
+      getTail: count => getAll().slice(Math.max(0, getAll().length - count)),
+      length: () => this.length(),
+      estimateTokens: message => this.estimateContentTokens(message.content, calibration),
+      imageEncodedBytes: hash => knownBytes?.get(hash) ?? this.blobManager.imageEncodedByteLength(hash),
+      setTokenCalibration: factor => {
+        if (Number.isFinite(factor) && factor > 0.25 && factor < 4) calibration = factor;
+      },
+      getTokenCalibration: () => calibration,
     };
   }
 
@@ -1702,6 +1748,11 @@ export class MessageStore {
     _index: number,
     resolveBlobs: boolean = true,
   ): StoredMessage {
+    const nativeCache = new Map<string, unknown>();
+    const native = internal.metadata?.openaiResponsesItems;
+    const metadata = resolveBlobs && Array.isArray(native)
+      ? { ...internal.metadata, openaiResponsesItems: native.map(item => this.blobManager.resolveNativeItem(item, nativeCache)) }
+      : internal.metadata;
     const stored: StoredMessage = {
       id,
       // chronicle record sequence captured when the message was appended
@@ -1718,12 +1769,12 @@ export class MessageStore {
       sequence: internal.sequence,
       participant: internal.participant,
       // When resolveBlobs is false, blob_ref placeholder blocks are passed
-      // through un-inflated (StoredContentBlock ⊂ wire-safe superset of
-      // ContentBlock for viewer purposes).
+      // through un-inflated. Internal strategy adapters acknowledge this
+      // distinction; the public metadata compile exposes StoredContentBlock[].
       content: resolveBlobs
-        ? this.blobManager.resolveBlobs(internal.content)
+        ? this.blobManager.resolveBlobs(internal.content, nativeCache)
         : (internal.content as unknown as ContentBlock[]),
-      metadata: internal.metadata,
+      metadata,
       timestamp: new Date(internal.timestamp),
       causedBy: internal.causedBy,
     };

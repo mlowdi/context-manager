@@ -11,6 +11,31 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '../types/message.js';
 
+/** Stitch content in order, coalescing only ordinary adjacent text. Native
+ * carriers and cache-marked blocks retain their individual representation. */
+export function concatContentBlocks(contents: readonly (readonly ContentBlock[])[]): ContentBlock[] {
+  const out: ContentBlock[] = [];
+  const textParts: string[] = [];
+  let firstText: Extract<ContentBlock, { type: 'text' }> | undefined;
+  const flush = (): void => {
+    if (!firstText) return;
+    out.push(textParts.length === 1 ? firstText : { ...firstText, text: textParts.join('') });
+    textParts.length = 0;
+    firstText = undefined;
+  };
+  for (const content of contents) for (const block of content) {
+    if (block.type === 'text' && !block.rawItem && !block.cache_control) {
+      firstText ??= block;
+      textParts.push(block.text);
+    } else {
+      flush();
+      out.push(block);
+    }
+  }
+  flush();
+  return out;
+}
+
 /**
  * Group consecutive messages that share a bodyGroupId into composite
  * messages whose body is the byte-faithful concatenation of the shards'
@@ -57,13 +82,8 @@ export function concatBodyGroups(
       (a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0)
     );
 
-    const concatenated = sorted.map((shard) => {
-      const res = shard.currentResolution ?? 0;
-      if (res === 0) {
-        return extractTextContent(shard.content);
-      }
-      return getRecallText(shard);
-    }).join('');
+    const content = concatContentBlocks(sorted.map(shard => (shard.currentResolution ?? 0) === 0
+      ? shard.content : [{ type: 'text', text: getRecallText(shard) } as ContentBlock]));
 
     // Build the composite message. Inherit id/participant/timestamp from
     // the first shard; combine metadata; build a single text content block.
@@ -71,7 +91,7 @@ export function concatBodyGroups(
       id: sorted[0].id,
       sequence: sorted[0].sequence,
       participant: sorted[0].participant,
-      content: [{ type: 'text', text: concatenated } as ContentBlock],
+      content,
       metadata: {
         ...(sorted[0].metadata ?? {}),
         bodyGroupId: groupId,
@@ -82,26 +102,6 @@ export function concatBodyGroups(
     out.push(composite);
   }
   return out;
-}
-
-/**
- * Extract text content from a message's content blocks. For shards we
- * expect (and require) all content to be text — they were produced by
- * the chunker, which only splits strings. If non-text blocks slip through,
- * they're stringified as best-effort.
- */
-function extractTextContent(blocks: ContentBlock[]): string {
-  const out: string[] = [];
-  for (const b of blocks) {
-    if (b.type === 'text') {
-      out.push(b.text);
-    } else {
-      // Non-text content in a sharded body shouldn't happen, but if it
-      // does, we serialize as a placeholder rather than crashing.
-      out.push(`[non-text content: ${b.type}]`);
-    }
-  }
-  return out.join('');
 }
 
 /**

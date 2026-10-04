@@ -50,6 +50,7 @@ export type {
   StoredMessage,
   BlobReference,
   StoredContentBlock,
+  NativeItemReference,
   MessageQuery,
   MessageQueryResult,
   TimeRangeQueryOptions,
@@ -68,6 +69,8 @@ export type {
   BranchInfo,
   ContextInjection,
   CompileResult,
+  MetadataContextMessage,
+  MetadataCompileResult,
   // Strategy types
   MessageStoreView,
   ContextLogView,

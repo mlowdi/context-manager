@@ -7,7 +7,8 @@ import type {
   VideoContent,
   Base64Source,
 } from '@animalabs/membrane';
-import type { BlobReference, StoredContentBlock } from './types/index.js';
+import { normalizeImageContent } from '@animalabs/membrane';
+import type { BlobReference, StoredContentBlock, NativeItemReference } from './types/index.js';
 
 /** Detect provider-supported raster image types from their byte signature.
  * Returns null for unknown/container types so callers can preserve the
@@ -104,19 +105,64 @@ export class BlobManager {
     return data;
   }
 
+  /** Reuse an encoded resolver-cache length when present. Legacy diagnostics
+   * may inspect a needed candidate hash: never encode/cache binary bytes. */
+  imageEncodedByteLength(hash: string, inspectLegacy = false): number | undefined {
+    const cached = this.resolveCache.get(hash);
+    if (cached !== undefined) return cached.length;
+    if (!inspectLegacy) return undefined;
+    const bytes = this.store.getBlob(hash);
+    if (!bytes) throw new Error(`Blob not found: ${hash}`);
+    return Math.ceil(bytes.byteLength / 3) * 4;
+  }
+
   /**
    * Extract blobs from content blocks and return references.
    * Replaces inline base64 data with blob references.
    */
   extractBlobs(content: ContentBlock[]): StoredContentBlock[] {
-    return content.map((block) => this.extractBlobFromBlock(block));
+    return content.map(block => {
+      const stored = this.extractBlobFromBlock(block);
+      return block.rawItem && typeof block.rawItem === 'object'
+        ? { ...stored, rawItem: this.extractNativeItem(block.rawItem) }
+        : stored;
+    });
+  }
+
+  private nativeReferences = new WeakMap<object, NativeItemReference>();
+
+  extractNativeItem(item: object): NativeItemReference {
+    if ('type' in item && item.type === 'native-item-ref' && 'hash' in item && typeof item.hash === 'string') {
+      return { type: 'native-item-ref', hash: item.hash };
+    }
+    const cached = this.nativeReferences.get(item);
+    if (cached) return cached;
+    const ref: NativeItemReference = { type: 'native-item-ref',
+      hash: this.store.storeBlob(Buffer.from(JSON.stringify(item), 'utf8'), 'application/json') };
+    this.nativeReferences.set(item, ref);
+    return ref;
+  }
+
+  resolveNativeItem(item: unknown, cache: Map<string, unknown>): unknown {
+    if (!item || typeof item !== 'object' || !('type' in item) || item.type !== 'native-item-ref') return item;
+    if (!('hash' in item) || typeof item.hash !== 'string') throw new Error('Invalid native item reference');
+    const { hash } = item;
+    if (cache.has(hash)) return cache.get(hash);
+    const bytes = this.store.getBlob(hash);
+    if (!bytes) throw new Error(`Native item blob not found: ${hash}`);
+    const value: unknown = JSON.parse(bytes.toString('utf8'));
+    cache.set(hash, value);
+    return value;
   }
 
   /**
    * Resolve blob references back to inline content.
    */
-  resolveBlobs(content: StoredContentBlock[]): ContentBlock[] {
-    return content.map((block) => this.resolveBlobInBlock(block));
+  resolveBlobs(content: StoredContentBlock[], nativeCache = new Map<string, unknown>()): ContentBlock[] {
+    return content.map(block => {
+      const resolved = this.resolveBlobInBlock(block, nativeCache);
+      return block.rawItem ? { ...resolved, rawItem: this.resolveNativeItem(block.rawItem, nativeCache) } : resolved;
+    });
   }
 
   private extractBlobFromBlock(block: ContentBlock): StoredContentBlock {
@@ -129,6 +175,10 @@ export class BlobManager {
         return this.extractFromAudio(block);
       case 'video':
         return this.extractFromVideo(block);
+      case 'tool_result':
+        return Array.isArray(block.content)
+          ? { ...block, content: this.extractBlobs(block.content) }
+          : block as StoredContentBlock;
       default:
         // Other block types pass through unchanged
         return block as StoredContentBlock;
@@ -136,13 +186,18 @@ export class BlobManager {
   }
 
   private extractFromImage(block: ImageContent): StoredContentBlock {
-    if (block.source.type === 'url') {
-      // URL sources don't need blob storage - pass through unchanged
-      return block;
+    const image = normalizeImageContent(block as unknown as Record<string, unknown>);
+    if (image.type !== 'image') {
+      throw new Error('Cannot archive image: invalid or unsupported image source/MIME');
+    }
+    if (image.source.type === 'url') {
+      // Remote URLs have no local payload; validated data URIs are base64.
+      return image;
     }
 
-    const ref = this.storeBase64(block.source, 'image');
-    return { type: 'blob_ref', ref };
+    const ref = this.storeBase64(image.source, 'image');
+    const { source: _source, type: _type, ...attributes } = image;
+    return { ...attributes, type: 'blob_ref', ref, encodedBytes: image.source.data.length };
   }
 
   private extractFromDocument(block: DocumentContent): StoredContentBlock {
@@ -181,12 +236,15 @@ export class BlobManager {
     };
   }
 
-  private resolveBlobInBlock(block: StoredContentBlock): ContentBlock {
+  private resolveBlobInBlock(block: StoredContentBlock, nativeCache: Map<string, unknown>): ContentBlock {
+    if (block.type === 'tool_result' && Array.isArray(block.content)) {
+      return { ...block, content: this.resolveBlobs(block.content, nativeCache) };
+    }
     if (block.type !== 'blob_ref') {
       return block as ContentBlock;
     }
 
-    const { ref } = block;
+    const { ref, encodedBytes: _encodedBytes, type: _type, ...attributes } = block;
     const data = this.cachedBlobBase64(ref.hash);
 
     if (data === null) {
@@ -206,7 +264,7 @@ export class BlobManager {
 
     switch (ref.originalType) {
       case 'image':
-        return { type: 'image', source } as ImageContent;
+        return { ...attributes, type: 'image', source } as ImageContent;
       case 'document':
         return { type: 'document', source } as DocumentContent;
       case 'audio':

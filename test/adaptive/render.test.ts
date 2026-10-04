@@ -4,7 +4,11 @@ import assert from 'node:assert/strict';
 import { chunkMessage } from '../../src/adaptive/chunker.js';
 import { concatBodyGroups, placeholderRecallText } from '../../src/adaptive/render.js';
 import type { StoredMessage } from '../../src/types/message.js';
-import type { ContentBlock } from '@animalabs/membrane';
+import { OpenAIResponsesFormatter, NativeFormatter, projectResponsesItem, type ContentBlock } from '@animalabs/membrane';
+import { ContextManager, AutobiographicalStrategy } from '../../src/index.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 function makeShard(
   body: string,
@@ -118,6 +122,63 @@ test('render: interleaved plain + grouped messages preserve order', () => {
   assert.equal(concatenated[2].id, 'p-2');
   assert.equal((concatenated[3].content[0] as { type: 'text'; text: string }).text, 'group two');
 });
+
+test('render: mixed media stays at its original shard boundary', () => {
+  const media: ContentBlock = { type: 'image', source: { type: 'url', url: 'https://example.test/between.png' } };
+  const cached: ContentBlock = { type: 'text', text: 'cached suffix', cache_control: { type: 'ephemeral' } };
+  const messages = [
+    makeShard('', 'mixed', 0, { content: [{ type: 'text', text: 'before' }, media, { type: 'text', text: 'after ' }] }),
+    makeShard('', 'mixed', 1, { content: [{ type: 'text', text: 'continued ' }, cached] }),
+  ];
+  const out = concatBodyGroups(messages, placeholderRecallText);
+  assert.deepEqual(out[0].content, [{ type: 'text', text: 'before' }, media,
+    { type: 'text', text: 'after continued ' }, cached]);
+});
+
+for (const imported of [false, true]) {
+  test(`adaptive ingress and recompilation preserve mixed order and one native representation (imported=${imported})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-ordered-media-shards-'));
+    const path = join(dir, 'store');
+    const before = 'A🙂'.repeat(60);
+    const after = 'B漢字'.repeat(600);
+    const imageUrl = 'https://example.test/sharded.png';
+    const native = { type: 'message', id: 'native-sharded-user', role: 'user', content: [
+      { type: 'input_text', text: before }, { type: 'input_image', image_url: imageUrl }, { type: 'input_text', text: after },
+    ] };
+    const original: ContentBlock[] = [{ type: 'text', text: before },
+      { type: 'image', source: { type: 'url', url: imageUrl } }, { type: 'text', text: after }];
+    const makeStrategy = () => new AutobiographicalStrategy({ adaptiveResolution: true,
+      targetChunkTokens: 100, headWindowTokens: 0, recentWindowTokens: 100000,
+      autoTickOnNewMessage: false, maxMessageTokens: 0, maxLiveImages: 0, maxLiveImageBytes: 0, imageStripDepthTokens: 0 });
+    let cm = await ContextManager.open({ path, strategy: makeStrategy() });
+    try {
+      cm.addMessage('User', imported ? projectResponsesItem(native) : original);
+      assert.ok(cm.getAllMessages().length > 1, 'the consumer path must actually shard the mixed message');
+      for (const restarted of [false, true]) {
+        if (restarted) { cm.close(); cm = await ContextManager.open({ path, strategy: makeStrategy() }); }
+        const compiled = await cm.compile({ maxTokens: 100000, reserveForResponse: 0 });
+        const replay = new OpenAIResponsesFormatter().buildMessages(compiled.messages, {
+          participantMode: 'multiuser', assistantParticipant: 'Codex', promptCaching: false,
+        });
+        assert.deepEqual(replay.messages, [native].map(item => imported ? item : {
+          type: 'message', role: 'user', content: item.content,
+        }), 'the native request contains exactly the original text/image/text sequence, without duplicate text');
+        if (imported) {
+          const auxiliary = new NativeFormatter().buildMessages(compiled.messages, {
+            participantMode: 'simple', assistantParticipant: 'Codex', humanParticipant: 'User', promptCaching: false,
+          });
+          const blocks = auxiliary.messages.flatMap(message => Array.isArray(message.content) ? message.content : []);
+          const imageIndex = blocks.findIndex(block => block.type === 'image');
+          assert.deepEqual(blocks.filter(block => block.type === 'image'),
+            [{ type: 'image', source: { type: 'url', url: imageUrl } }]);
+          const contentText = (parts: typeof blocks) => parts.map(block => block.type === 'text' ? block.text : '[non-text]').join('');
+          assert.equal(contentText(blocks.slice(0, imageIndex)), before);
+          assert.equal(contentText(blocks.slice(imageIndex + 1)), after);
+        }
+      }
+    } finally { cm.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
 
 test('render: chunker + render round-trips with realistic large doc', () => {
   // Build a synthetic doc, chunk it, render it back, verify byte-identical.

@@ -1,5 +1,5 @@
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, NormalizedMessage, ContentBlock, ToolDefinition } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, ContentBlock, ToolDefinition, LiveImagePolicy } from '@animalabs/membrane';
 import type {
   MessageId,
   Sequence,
@@ -25,6 +25,11 @@ import type {
   ChannelTokenStatsOptions,
   ContextInjection,
   CompileResult,
+  MetadataCompileResult,
+  MetadataContextMessage,
+  StoredContentBlock,
+  MessageStoreView,
+  ContextLogView,
   ProtectedRange,
   PinLevelOptions,
   SearchQuery,
@@ -192,6 +197,7 @@ export class ContextManager {
   private holdingAdds: MessageId[] | null = null;
   /** Read-only auxiliary stores merged into the strategy-facing view. */
   private auxiliaryStores: MessageStore[];
+  private unsubscribeMessageStore: () => void;
 
   private constructor(
     store: JsStore,
@@ -217,7 +223,7 @@ export class ContextManager {
     this.auxiliaryStores = auxiliaryStores;
 
     // Set up edit propagation
-    this.messageStore.addListener((event) => this.handleMessageStoreEvent(event));
+    this.unsubscribeMessageStore = this.messageStore.addListener((event) => this.handleMessageStoreEvent(event));
   }
 
   /**
@@ -227,19 +233,39 @@ export class ContextManager {
    * slots into the timeline first, then apply the exclusion filter, so a
    * filter sees (and can exclude from) the merged world.
    */
-  private strategyMessageView() {
+  private strategyMessageView(metadataOnly = false, knownBytes?: ReadonlyMap<string, number>,
+    inspectLegacyBytes?: (hash: string, cached?: number) => number) {
+    // The selector's legacy interface is normalized, but its shared policy and
+    // estimator also understand stored references. This adapter is private:
+    // only compileMetadata exposes these entries, with honest stored types.
+    const viewFor = (store: MessageStore): MessageStoreView => metadataOnly
+      ? store.createMetadataView(knownBytes) as unknown as MessageStoreView : store.createView();
     let view = mergeMessageStoreViews(
-      this.messageStore.createView(),
-      this.auxiliaryStores.map((s) => s.createView()),
+      viewFor(this.messageStore),
+      this.auxiliaryStores.map(viewFor),
     );
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
+    if (metadataOnly && inspectLegacyBytes) {
+      const lookup = view.imageEncodedBytes?.bind(view);
+      // Called only by the shared image policy after count/depth eligibility,
+      // and by lazy estimates as a budget decision consumes a candidate.
+      view.imageEncodedBytes = hash => inspectLegacyBytes(hash, lookup?.(hash));
+    }
     // Live predicate (strategies capture views across long drains). Every
     // view built above is a fresh object, so this never leaks into a store.
     const holds = this.compressionHolds;
-    view.isCompressionHeld = (id: MessageId) => holds.has(id);
-    view.hasCompressionHolds = () => holds.size > 0;
+    view.isCompressionHeld = (id: MessageId) => {
+      if (!holds.has(id)) return false;
+      const expiresAt = this.compressionHoldInfo.get(id)?.expiresAt;
+      return !metadataOnly || expiresAt === undefined || expiresAt > this.now();
+    };
+    view.hasCompressionHolds = () => {
+      if (!metadataOnly) return holds.size > 0;
+      for (const id of holds.keys()) if (view.isCompressionHeld!(id)) return true;
+      return false;
+    };
     return view;
   }
 
@@ -381,9 +407,7 @@ export class ContextManager {
     try {
       await manager.initializeStrategy(openingBranch);
     } catch (error) {
-      if (ownsStore) {
-        try { store.close(); } catch { /* the initialize error is the one to report */ }
-      }
+      try { manager.close(); } catch { /* the initialize error is the one to report */ }
       throw error;
     }
     manager.initialized = true;
@@ -1045,6 +1069,68 @@ export class ContextManager {
     return result;
   }
 
+  /** Read-only selected-context diagnostics. References are deliberately NOT
+   * inference-ready; new refs/native carriers load no blobs. Necessary legacy
+   * count/depth/budget candidates may inspect binary length once, including a
+   * boundary candidate that remains summarized. No encoding/payload retention,
+   * writes, compression or debug logging. Unrelated history is not resolved. */
+  async compileMetadata(budget: TokenBudget = { maxTokens: 100000, reserveForResponse: 4000 }): Promise<MetadataCompileResult> {
+    // Strategies share the selector but receive an unresolved private adapter.
+    const log = this.contextLog.createMetadataView() as unknown as ContextLogView;
+    const knownBytes = new Map<string, number>();
+    const bytePolicy = this.strategy.liveImagePolicy?.maxLiveImageBytes;
+    const needsBytes = this.strategy.liveImagePolicy !== undefined && (bytePolicy === undefined || bytePolicy > 0);
+    const inspectLegacyBytes = needsBytes ? (hash: string, cached?: number): number => {
+      const length = cached ?? this.messageStore.inspectLegacyImageEncodedBytes(hash);
+      knownBytes.set(hash, length);
+      return length;
+    } : undefined;
+    const view = this.strategyMessageView(true, knownBytes, inspectLegacyBytes);
+    const entries = this.strategy.select(view, log, budget, { dryRun: true });
+    const annotate = (blocks: StoredContentBlock[]): StoredContentBlock[] => {
+      if (knownBytes.size === 0) return blocks;
+      let result: StoredContentBlock[] | undefined;
+      for (let i = 0; i < blocks.length; i++) {
+        const block = blocks[i];
+        let next = block;
+        if (block.type === 'blob_ref' && block.encodedBytes === undefined && knownBytes.has(block.ref.hash)) {
+          next = { ...block, encodedBytes: knownBytes.get(block.ref.hash) };
+        } else if (block.type === 'tool_result' && Array.isArray(block.content)) {
+          const content = annotate(block.content);
+          if (content !== block.content) next = { ...block, content };
+        }
+        if (next !== block) { result ??= blocks.slice(); result[i] = next; }
+      }
+      return result ?? blocks;
+    };
+    // Detach only selected JSON containers. Primitive strings (including URL
+    // values) stay shared; no archived/native payload is loaded or encoded.
+    const detach = <T>(value: T): T => {
+      if (Array.isArray(value)) return value.map(item => detach(item)) as T;
+      if (value !== null && typeof value === 'object') {
+        const copy = { ...(value as Record<string, unknown>) };
+        for (const key of Object.keys(copy)) copy[key] = detach(copy[key]);
+        return copy as T;
+      }
+      return value;
+    };
+    const messages: MetadataContextMessage[] = [];
+    for (const entry of entries) {
+      const parts = splitMixedToolMessages([{ participant: entry.participant, content: entry.content }]);
+      for (let i = 0; i < parts.length; i++) {
+        // The input came from metadata views; normalization only partitions it.
+        const content = detach(annotate(parts[i].content as unknown as StoredContentBlock[]));
+        messages.push({ participant: parts[i].participant, content,
+          ...(entry.sourceMessageId ? { sourceMessageId: entry.sourceMessageId } : {}),
+          ...(entry.sourceMessageIds ? { sourceMessageIds: [...entry.sourceMessageIds] } : {}),
+          ...(entry.cacheMarker && i === parts.length - 1 ? { cacheBreakpoint: true } : {}) });
+      }
+    }
+    const calibration = view.getTokenCalibration?.() ?? this.messageStore.getTokenCalibration();
+    return { messages, estimatedTokens: messages.reduce((sum, message) =>
+      sum + this.messageStore.estimateContentTokens(message.content, calibration), 0) };
+  }
+
   /**
    * Log the compiled context to stderr for debugging.
    * Uses stderr so it doesn't pollute the context log (which strategies read).
@@ -1093,6 +1179,13 @@ export class ContextManager {
    */
   getStrategy(): ContextStrategy {
     return this.strategy;
+  }
+
+  /** Carry the strategy limits and its exact calibrated depth prices onto
+   * requests that will grow through native tool rounds. */
+  getLiveImagePolicy(): LiveImagePolicy | undefined {
+    const policy = this.strategy.liveImagePolicy;
+    return policy ? { ...policy, estimateTokens: content => this.messageStore.estimateContentTokens(content) } : undefined;
   }
 
   /** Read the active strategy's allowlisted live settings, if supported. */
@@ -1508,10 +1601,11 @@ export class ContextManager {
    * Close the context manager.
    *
    * If the manager owns the store (created via path config), this closes the store.
-   * If the app owns the store (passed via store config), this is a no-op;
-   * the app is responsible for closing the store when done.
+   * Edit propagation is detached in either case. An app-owned store remains
+   * open; the app is responsible for closing it when done.
    */
   close(): void {
+    this.unsubscribeMessageStore();
     if (this.ownsStore) {
       this.store.close();
     }

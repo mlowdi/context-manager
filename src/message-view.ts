@@ -42,6 +42,7 @@ export function filterMessageStoreView(
     },
     length: () => all().length,
     estimateTokens: (msg: StoredMessage) => view.estimateTokens(msg),
+    imageEncodedBytes: view.imageEncodedBytes?.bind(view),
     setTokenCalibration: view.setTokenCalibration
       ? (f: number) => view.setTokenCalibration!(f)
       : undefined,
@@ -94,6 +95,15 @@ export function mergeMessageStoreViews(
     },
     length: () => auxiliary.reduce((n, v) => n + v.length(), primary.length()),
     estimateTokens: (msg: StoredMessage) => primary.estimateTokens(msg),
+    imageEncodedBytes: hash => {
+      const own = primary.imageEncodedBytes?.(hash);
+      if (own !== undefined) return own;
+      for (const view of auxiliary) {
+        const length = view.imageEncodedBytes?.(hash);
+        if (length !== undefined) return length;
+      }
+      return undefined;
+    },
     setTokenCalibration: primary.setTokenCalibration
       ? (f: number) => primary.setTokenCalibration!(f)
       : undefined,

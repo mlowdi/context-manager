@@ -11,7 +11,10 @@ import type {
   Sequence,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
-import type { ContentBlock } from '@animalabs/membrane';
+import {
+  filterImageMessages, imageDepthStart, DEFAULT_MAX_LIVE_IMAGE_BYTES,
+  type ContentBlock, type LiveImagePolicy,
+} from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
@@ -64,13 +67,6 @@ export interface WindowedPassthroughOptions {
   imageStripDepthTokens?: number;
   maxLiveImageBytes?: number;
 }
-
-/** Text substituted for an image block once it leaves the live-image window
- *  (identical to the autobiographical strategy's placeholder, so a merged
- *  timeline reads the same in both agents' windows). */
-const IMAGE_PLACEHOLDER = '[image dropped from live context]';
-/** Mirrors `AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES` (protected there). */
-const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 
 /**
  * Passthrough over a recent window, anchored at a sequence number.
@@ -342,47 +338,20 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   // Live-image policy (mirrors AutobiographicalStrategy.applyImageStripping)
   // --------------------------------------------------------------------------
 
+  get liveImagePolicy(): LiveImagePolicy {
+    return { maxLiveImages: this.maxLiveImages, imageStripDepthTokens: this.imageStripDepthTokens,
+      maxLiveImageBytes: this.maxLiveImageBytes };
+  }
+
   private applyImageStripping(
     entries: ContextEntry[],
     messages: StoredMessage[],
     store: MessageStoreView,
   ): void {
-    const maxLive = this.maxLiveImages;
-    const depthTokens = this.imageStripDepthTokens;
-    const maxLiveBytes = this.maxLiveImageBytes;
-    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return;
-
-    // Depth boundary: walk newest→oldest over the whole view (the policy is
-    // "distance from the newest message", not "distance from the anchor").
-    let stripStart = 0;
-    if (depthTokens > 0) {
-      let tokens = 0;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        tokens += store.estimateTokens(messages[i]);
-        if (tokens > depthTokens) { stripStart = i + 1; break; }
-      }
-    }
-
-    let keptImages = 0;
-    let keptImageBytes = 0;
-    // Entries are in timeline order; the policy counts newest-first.
-    for (let e = entries.length - 1; e >= 0; e--) {
-      const entry = entries[e];
-      if (!entry.content.some((b) => b.type === 'image')) continue;
-      const tooDeep = depthTokens > 0 && entry.index < stripStart;
-      entry.content = entry.content.map((block) => {
-        if (block.type !== 'image') return block;
-        const bytes = imageBlockBytes(block);
-        const overCount = maxLive > 0 && keptImages >= maxLive;
-        const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
-        if (tooDeep || overCount || overBytes) {
-          return { type: 'text', text: IMAGE_PLACEHOLDER } as ContentBlock;
-        }
-        keptImages++;
-        keptImageBytes += bytes;
-        return block;
-      });
-    }
+    const stripStart = imageDepthStart(messages, this.imageStripDepthTokens, message => store.estimateTokens(message));
+    const shaped = filterImageMessages(entries, this.liveImagePolicy, entry => entry.index >= stripStart,
+      undefined, store.imageEncodedBytes?.bind(store));
+    for (let i = 0; i < entries.length; i++) entries[i].content = shaped[i].content;
   }
 
   // --------------------------------------------------------------------------
@@ -423,11 +392,6 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 // ----------------------------------------------------------------------------
 // Helpers (ports of the autobiographical strategy's protected utilities)
 // ----------------------------------------------------------------------------
-
-function imageBlockBytes(block: unknown): number {
-  const src = (block as { source?: { data?: string } }).source;
-  return typeof src?.data === 'string' ? src.data.length : 0;
-}
 
 /** Text-only token estimate at the same chars/4 rate the truncation marker reports. */
 function estimateTextOnlyTokens(content: ContentBlock[]): number {

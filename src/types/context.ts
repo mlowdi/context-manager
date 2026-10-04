@@ -17,7 +17,7 @@ export type SourceRelation =
  * An entry in the context log.
  * The context log is a materialized, editable working set derived from the message store.
  */
-export interface ContextEntry {
+export interface ContextEntry<TBlock = ContentBlock> {
   /** Index in the context log */
   index: number;
   /** Source message ID (if derived from message store) */
@@ -33,8 +33,8 @@ export interface ContextEntry {
   sourceRelation?: SourceRelation;
   /** Participant name */
   participant: string;
-  /** Materialized content blocks */
-  content: ContentBlock[];
+  /** Resolved blocks by default; metadata entries use unresolved references. */
+  content: TBlock[];
   /** For prompt caching (future) */
   cacheMarker?: boolean;
   /** Internal cache-layout identity when this entry ends one atomic rendered
@@ -124,6 +124,21 @@ export interface CompileResult {
    * Separated because the system prompt is outside context-manager's scope.
    */
   systemInjections: ContentBlock[];
+}
+
+/** Diagnostics only: NOT an inference-ready NormalizedMessage. */
+export interface MetadataContextMessage {
+  participant: string;
+  content: StoredContentBlock[];
+  sourceMessageId?: MessageId;
+  sourceMessageIds?: MessageId[];
+  cacheBreakpoint?: boolean;
+}
+
+export interface MetadataCompileResult {
+  messages: MetadataContextMessage[];
+  /** Post-policy selected content, priced with the store's calibrated estimator. */
+  estimatedTokens: number;
 }
 
 /**
