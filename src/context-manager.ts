@@ -439,9 +439,11 @@ export class ContextManager {
     causedBy?: MessageId[],
     options?: AddMessageOptions
   ): MessageId {
+    MessageStore.validateTimestampMs(options?.timestampMs);
+    const timestampMs = options?.timestampMs ?? Date.now();
     this.expireCompressionHolds();
     if (!options?.holdCompression) {
-      return this.appendMessage(participant, content, metadata, causedBy);
+      return this.appendMessage(participant, content, metadata, causedBy, timestampMs);
     }
     const holdOptions = options.holdCompression === true ? {} : options.holdCompression;
     this.validateHoldOptions(holdOptions);
@@ -452,7 +454,7 @@ export class ContextManager {
     this.holdingAddAt = this.now();
     let id: MessageId;
     try {
-      id = this.appendMessage(participant, content, metadata, causedBy);
+      id = this.appendMessage(participant, content, metadata, causedBy, timestampMs);
     } finally {
       this.holdingAdds = null;
       this.holdingAddOptions = undefined;
@@ -465,7 +467,8 @@ export class ContextManager {
     participant: string,
     content: ContentBlock[],
     metadata?: MessageMetadata,
-    causedBy?: MessageId[]
+    causedBy?: MessageId[],
+    timestampMs?: number
   ): MessageId {
     // Optional strategy-driven ingestion-time chunking
     const strategyAny = this.strategy as unknown as {
@@ -487,14 +490,15 @@ export class ContextManager {
             {
               bodyGroupId: decision.bodyGroupId,
               shardIndex: shard.shardIndex,
-            }
+            },
+            timestampMs
           );
           if (firstId === null) firstId = message.id;
         }
         return firstId!;
       }
     }
-    const message = this.messageStore.append(participant, content, metadata, causedBy);
+    const message = this.messageStore.append(participant, content, metadata, causedBy, undefined, timestampMs);
     return message.id;
   }
 
@@ -1455,6 +1459,22 @@ export class ContextManager {
     }
   }
 
+  /**
+   * Seal a caller-selected archival batch without changing ordinary live
+   * window/chunk policy. Inference remains explicit: tick() drains the sealed
+   * native chunks. Repeating this call or reopening cannot re-key membership.
+   */
+  finalizeArchivalBatch(throughId: MessageId): void {
+    if (!this.initialized) throw new Error('ContextManager is not initialized');
+    if (this.viewFilter || this.auxiliaryStores.length > 0) {
+      throw new Error('Archival finalization requires the canonical single-owner message view');
+    }
+    if (!this.strategy.finalizeArchivalBatch) {
+      throw new Error('Strategy does not support archival batch finalization');
+    }
+    this.strategy.finalizeArchivalBatch(this.createStrategyContext(), throughId);
+  }
+
   // ==========================================================================
   // Internal
   // ==========================================================================
@@ -1484,7 +1504,7 @@ export class ContextManager {
 
   /**
    * Live tool definitions for the owning agent, refreshed by the host on
-   * every activation (Agent.buildActivationRequest in agent-framework).
+   * every activation (Agent.startStreamWithInjections in agent-framework).
    * Threaded into StrategyContext so compression/summarizer LLM calls can
    * declare the same tools as the live instance — required to avoid
    * reasoning_extraction refusals on transcripts containing tool blocks.

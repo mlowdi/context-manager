@@ -388,6 +388,16 @@ export class MessageStore {
    */
   static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'currentResolution', 'lockedByAgent'] as const;
 
+  /** Shared validation for ordinary, sharded and direct appends. */
+  static validateTimestampMs(timestampMs: number | undefined): void {
+    if (timestampMs !== undefined && (
+      typeof timestampMs !== 'number' || !Number.isInteger(timestampMs) ||
+      Math.abs(timestampMs) > 8_640_000_000_000_000
+    )) {
+      throw new RangeError('timestampMs must be a valid integer epoch millisecond');
+    }
+  }
+
   /**
    * Append a new message to the store.
    *
@@ -405,8 +415,11 @@ export class MessageStore {
       shardIndex?: number;
       currentResolution?: number;
       lockedByAgent?: boolean;
-    }
+    },
+    timestampMs?: number
   ): StoredMessage {
+    MessageStore.validateTimestampMs(timestampMs);
+    const timestamp = timestampMs ?? Date.now();
     // Keep imported native metadata as audit testimony, but also materialize
     // typed carriers so selection/compression cannot lose its images.
     const native = metadata?.openaiResponsesItems;
@@ -423,7 +436,7 @@ export class MessageStore {
       participant,
       content: storedContent,
       metadata: storedMetadata,
-      timestamp: Date.now(),
+      timestamp,
       causedBy,
       ...(extra ?? {}),
     };

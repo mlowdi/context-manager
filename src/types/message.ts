@@ -33,6 +33,12 @@ export interface MessageMetadata {
  */
 export interface AddMessageOptions {
   /**
+   * Historical indexing time. Must be an integer epoch millisecond within
+   * JavaScript's Date range; omitted means Date.now(). Every ingress shard
+   * receives the same time. Invalid values are rejected before any writes.
+   */
+  timestampMs?: number;
+  /**
    * Place a transient compression hold on the new message before strategies
    * are notified. See ContextManager.holdCompression.
    */

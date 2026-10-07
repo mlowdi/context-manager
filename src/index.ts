@@ -36,7 +36,8 @@ export type { ConfigLayer, ConfigResolutionSemantics, EffectiveConfigReport } fr
 // classifyInferenceError); exporting them from the root gives consumers a
 // real `instanceof` instead of stringly-typed `err.name` matching.
 export { OverBudgetError, UncoveredDropError } from './adaptive/picker.js';
-export { StoreTopologyError, type TopologyViolation } from './strategies/autobiographical.js';
+export { ARCHIVAL_MEMORY_LOCAL_CAP_CODE } from './types/strategy.js';
+export { StoreTopologyError, ArchivalCyberPolicyFallbackHalt, type TopologyViolation } from './strategies/autobiographical.js';
 export { planTopologyRepair, type RepairPlan, type RepairInputs, type RepairOptions } from './repair/topology.js';
 export type { OverBudgetDiagnostics } from './adaptive/picker.js';
 

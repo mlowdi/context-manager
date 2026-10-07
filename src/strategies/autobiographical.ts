@@ -1,9 +1,10 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import {
-  NativeFormatter, filterImageMessages, createImageMessageFilter, projectNativeImageContent, imageDepthStart,
+  MembraneError, NativeFormatter, filterImageMessages, createImageMessageFilter, projectNativeImageContent, imageDepthStart,
   DEFAULT_MAX_LIVE_IMAGE_BYTES, isVisualImageContent, isImageReference, hasVisualImageContent, estimateImagePolicyContentTokens, type LiveImagePolicy,
 } from '@animalabs/membrane';
+import { isDeepStrictEqual, types } from 'node:util';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
@@ -32,7 +33,7 @@ import type {
   PreviewResult,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
-import { getSummaryParentId } from '../types/strategy.js';
+import { ARCHIVAL_MEMORY_LOCAL_CAP_CODE, getSummaryParentId } from '../types/strategy.js';
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
@@ -45,7 +46,7 @@ import {
 } from '../tool-prose-hoist.js';
 import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
 import { defaultTokenEstimator, MessageStore } from '../message-store.js';
-import { persistMintRequestPreimage } from '../mint-preimage.js';
+import { persistMintRequestPreimage, getMintRequestPreimageBytes } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -413,6 +414,8 @@ export interface Chunk {
   phaseType?: string;
   /** ID of the persisted ChunkRecord backing this chunk (chunk persistence). */
   recordId?: string;
+  /** Explicit sealed archival batch membership, independent of live windows. */
+  archival?: boolean;
 }
 
 /**
@@ -431,6 +434,8 @@ export interface Chunk {
  * record gracefully instead of re-keying its neighbors.
  */
 export interface ChunkRecord {
+  /** Explicit archival boundary; bypasses live speculative tail holdback. */
+  archival?: boolean;
   /** Stable record id ("c-<n>"). */
   id: string;
   /** Exact message IDs of the closed chunk, in order. */
@@ -459,6 +464,8 @@ interface CompressionRefusalVariantRecord {
 interface CompressionRefusalQuarantineRecord {
   key: string;
   familyKey: string;
+  /** Complete unchanged family before archival admission/carrier refitting. */
+  admissionFamilyKey?: string;
   model: string;
   chunkSourceHash: string;
   frontierHash: string;
@@ -868,14 +875,85 @@ function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
  * invalid_request 400 about thinking blocks (e.g. the "cannot be modified"
  * class), never a policy refusal. Retry once, stripped, loudly.
  */
-function isCarrierTransportRejection(error: unknown): boolean {
+function isCarrierTransportRejection(error: unknown, archival = false): boolean {
   const e = error as { httpStatus?: number; type?: string; message?: string };
   const msg = (e?.message ?? '').toLowerCase();
+  if (archival) return e?.type === 'invalid_request' && (msg.includes('thinking') || msg.includes('reasoning'));
   const badRequest =
     e?.httpStatus === 400 ||
     (typeof e?.type === 'string' && e.type.toLowerCase().includes('invalid')) ||
     msg.includes('invalid_request');
   return badRequest && (msg.includes('thinking') || msg.includes('reasoning'));
+}
+
+function isArchivalLocalCap(error: unknown): boolean {
+  const e = error as { type?: unknown; retryable?: unknown; providerErrorCode?: unknown } | null;
+  return e?.type === 'context_length' && e.retryable === false &&
+    e.providerErrorCode === ARCHIVAL_MEMORY_LOCAL_CAP_CODE;
+}
+
+/** Mandatory-floor debt, naming the actual rejected request without its private body. */
+class ArchivalAdmissionRejection extends Error {
+  readonly type = 'context_length';
+  readonly retryable = false;
+  readonly providerErrorCode = ARCHIVAL_MEMORY_LOCAL_CAP_CODE;
+  constructor(readonly requestHash: string) {
+    super('Archival mandatory memory request exceeds local admission cap; work remains resumable');
+    this.name = 'ArchivalAdmissionRejection';
+  }
+}
+
+function isConfirmedCyberPolicy(error: unknown): boolean {
+  if (!error || typeof error !== 'object' || types.isProxy(error) || !(error instanceof MembraneError)) return false;
+  return Object.getOwnPropertyDescriptor(error, 'type')?.value === 'safety' &&
+    Object.getOwnPropertyDescriptor(error, 'retryable')?.value === false &&
+    Object.getOwnPropertyDescriptor(error, 'providerErrorCode')?.value === 'cyber_policy';
+}
+
+/** A changed native request lease is not a provider policy outcome. */
+class ArchivalNativeOwnerDiscard extends Error {
+  constructor() {
+    super('Stale archival strategy state; native request generation changed before acceptance');
+    this.name = 'ArchivalNativeOwnerDiscard';
+  }
+}
+
+type ArchivalFallbackOutcome = 'provider_error' | 'refusal' | 'incomplete' | 'unusable_empty' | 'served_model' | 'preimage';
+/** LOCAL one-attempt stop, not a provider refusal or a retryable merge disposition. */
+export class ArchivalCyberPolicyFallbackHalt extends Error {
+  readonly code = 'archival_cyber_policy_fallback_halt';
+  readonly retryable = false;
+  readonly primaryModel = 'gpt-6.1-sol';
+  readonly fallbackModel = 'gpt-daybreak-blue-latest';
+  readonly reason = 'cyber_policy';
+  readonly errorType: MembraneError['type'];
+  readonly providerErrorCode?: 'cyber_policy' | typeof ARCHIVAL_MEMORY_LOCAL_CAP_CODE;
+  readonly httpStatus?: number;
+  readonly evidenceHash: string;
+  constructor(readonly requestHash: string, readonly outcome: ArchivalFallbackOutcome, error?: unknown) {
+    super(`Archival cyber-policy fallback halted (${outcome}); work remains resumable`);
+    this.name = 'ArchivalCyberPolicyFallbackHalt';
+    this.errorType = 'unknown';
+    let evidence = outcome as string;
+    if (error && typeof error === 'object' && !types.isProxy(error)) {
+      const message = Object.getOwnPropertyDescriptor(error, 'message')?.value;
+      if (typeof message === 'string') evidence = message;
+      if (error instanceof MembraneError) {
+        const type = Object.getOwnPropertyDescriptor(error, 'type')?.value;
+        switch (type) {
+          case 'rate_limit': case 'context_length': case 'invalid_request': case 'auth':
+          case 'server': case 'network': case 'timeout': case 'abort': case 'safety':
+          case 'unsupported': case 'unknown': this.errorType = type;
+        }
+        const status = Object.getOwnPropertyDescriptor(error, 'httpStatus')?.value;
+        if (Number.isInteger(status) && status >= 100 && status <= 599) this.httpStatus = status;
+        const code = Object.getOwnPropertyDescriptor(error, 'providerErrorCode')?.value;
+        if (isConfirmedCyberPolicy(error)) this.providerErrorCode = 'cyber_policy';
+        if (this.errorType === 'context_length' && code === ARCHIVAL_MEMORY_LOCAL_CAP_CODE) this.providerErrorCode = ARCHIVAL_MEMORY_LOCAL_CAP_CODE;
+      }
+    }
+    this.evidenceHash = createHash('sha256').update(evidence).digest('hex');
+  }
 }
 
 function requestCarriesReasoning(request: NormalizedRequest): boolean {
@@ -1086,7 +1164,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
   protected summaryIdCounter = 0;
-  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; serverErrorStreak?: number }> = [];
+  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; serverErrorStreak?: number; archivalGeneration?: number }> = [];
 
   /**
    * Live merge-quarantine records keyed by sha256(sourceIds). Loaded from
@@ -1108,6 +1186,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected ns: string = '';
   protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
   protected get chunksStateId(): string { return `${this.ns}/autobio:chunks`; }
+  protected get archivalBatchesStateId(): string { return `${this.ns}/autobio:archival-batches`; }
   /** Memories are identity-bearing: a substitute model writing summaries in
    *  the agent's voice corrupts the record. If the configured model is
    *  missing, refuse LOUDLY instead of silently substituting a default -
@@ -1332,6 +1411,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      this.assertCurrentIfArchival();
       const current = this.readCompressionQuarantineProjection();
       for (const target of targets) {
         if (current.get(target.key)?.generationId !== target.generationId) continue;
@@ -1715,6 +1795,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       this.migrateChunkRecords(ctx.messageStore);
       if (abortIfStale()) return;
+      if (!this.config.auditOnly) {
+        const archivalBatches = this.store?.getStateJson(this.archivalBatchesStateId);
+        const endpoint = Array.isArray(archivalBatches) ? archivalBatches[archivalBatches.length - 1]?.throughId : undefined;
+        if (typeof endpoint === 'string') this.finalizeArchivalBatch(ctx, endpoint);
+      }
+      if (abortIfStale()) return;
       this.rebuildChunks(ctx.messageStore);
       if (abortIfStale()) return;
       if (!this.config.auditOnly) this.sanitizePersistedMergeQueue(ctx.messageStore);
@@ -1840,6 +1926,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Append a record to the chunks slot + in-memory mirror. */
   protected appendChunkRecord(record: ChunkRecord): void {
     this.requireBranchMutation('appendChunkRecord');
+    this.assertCurrentIfArchival();
     this.chunkRecords.push(record);
     this.store?.appendToStateJson(this.chunksStateId, record);
   }
@@ -1852,6 +1939,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected markChunkRecordCompressed(recordId: string | undefined, summaryId: string): void {
     if (!this.chunkPersistenceEnabled || !recordId) return;
     this.requireBranchMutation('markChunkRecordCompressed');
+    this.assertCurrentIfArchival();
     const rec = this.chunkRecords.find(r => r.id === recordId);
     if (!rec) return;
     rec.compressed = true;
@@ -2064,19 +2152,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
+    // Load ALL durable debt mirrors before guarded interruption recovery.
+    // A fresh owner must compare the persisted queue/quarantine, not defaults.
     const counter = this.store.getStateJson(this.counterStateId);
     this.summaryIdCounter = typeof counter === 'number' ? counter : 0;
-
     const queue = this.store.getStateJson(this.mergeQueueStateId);
-    this.mergeQueue = Array.isArray(queue)
-      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; serverErrorStreak?: number }>)
-      : [];
+    this.mergeQueue = Array.isArray(queue) ? queue : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     this.mergeQuarantine = new Map(
       (Array.isArray(mergeQuarantine) ? (mergeQuarantine as MergeQuarantineRecord[]) : [])
         .filter((r) => r && typeof r.key === 'string' && Array.isArray(r.sourceIds))
         .map((r) => [r.key, r]),
     );
+
+    // An archival merge's append is the commit point. A killed writer may
+    // leave only some child edges marked; restore those authored memberships
+    // BEFORE queue sanitation/threshold discovery can mint a duplicate parent.
+    // Ordinary live load policy is unchanged for chronicles without seals.
+    if (this.chunkRecords.some(record => record.archival)) {
+      const summariesById = new Map(this.summaries.map(summary => [summary.id, summary]));
+      const archivalIds = new Set(this.chunkRecords.filter(record => record.archival).flatMap(record => record.sourceIds));
+      for (const parent of this.summaries) {
+        if (parent.level <= 1) continue;
+        const leaves = new Set<MessageId>();
+        this.expandSummaryToLeafMessageIds(parent, summariesById, leaves);
+        if (leaves.size === 0 || [...leaves].some(id => !archivalIds.has(id))) continue;
+        for (const id of parent.sourceIds) {
+          const child = summariesById.get(id);
+          if (!child || child.level !== parent.level - 1) {
+            throw new Error('Committed archival merge has a missing or wrong-level source');
+          }
+          if (child.mergedInto && child.mergedInto !== parent.id) {
+            throw new Error('Committed archival merge has conflicting native parent membership');
+          }
+          if (!child.mergedInto) this.setMergedInto(child, parent.id);
+        }
+      }
+    }
+
     const validMergeQueue = this.mergeQueue.filter(
       merge => !merge.sourceIds.some(id => removedEmptyIds.has(id) && !byId.has(id)),
     );
@@ -2505,6 +2618,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   protected pushSummary(entry: SummaryEntry): void {
     this.requireBranchMutation('pushSummary');
+    this.assertCurrentIfArchival();
     if (typeof entry.content !== 'string' || entry.content.trim().length === 0) {
       throw new Error(
         `[autobiographical] refusing to persist empty summary ${entry.id} at L${entry.level}`,
@@ -2657,6 +2771,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return true;
   }
 
+  /** Re-run existing request-only image cleanup and cache seams after structural refitting. */
+  private finishMintMessages(
+    cleaned: Array<{ participant: string; content: ContentBlock[] }>,
+    recallLadder: readonly SummaryEntry[],
+    capped: boolean,
+  ): { mintMessages: NormalizedRequest['messages']; mintSeamed: boolean } {
+    this.capCompressionImageBytes(cleaned, this.config.maxCompressionImageBytes ??
+      AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES);
+    const mintMessages = cleaned
+      .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+      .filter(m => m.content.length > 0);
+    const mintSeamed = this.applyMintCacheSeams(mintMessages, recallLadder, capped);
+    return { mintMessages, mintSeamed };
+  }
+
   private sameAuthoredSummary(a: SummaryEntry, b: SummaryEntry): boolean {
     return a.id === b.id &&
       a.level === b.level &&
@@ -2693,6 +2822,110 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Metadata-only observability and a conservative budget check. The ordinary
     // formatter/provider remains authoritative for rendered token accounting.
     return Math.ceil(JSON.stringify(request).length / 4);
+  }
+
+  private markArchivalMemoryRequest(request: NormalizedRequest, operation: 'l1' | 'merge' | 'transition', archival: boolean): void {
+    if (!archival) return;
+    const last = request.messages.length - 1;
+    const directive = request.messages[last];
+    if (!directive || directive.participant !== 'Context Manager') throw new Error('Archival memory request requires its owned final directive');
+    // Never import this provenance from historical content/metadata. Clone only
+    // the owned directive so recall variants cannot mutate their canonical request.
+    const owned = { ...directive, metadata: { ...directive.metadata } };
+    delete owned.metadata.archivalMemory;
+    request.messages = request.messages.slice();
+    request.messages[last] = owned;
+    const nativeEstimatedPromptTokens = this.estimateTokens([{ type: 'text', text: request.system ?? '' }]) + request.messages.reduce((total, message) => total + this.estimateTokens(message.content), 0);
+    owned.metadata.archivalMemory = {
+      version: 1, operation, model: request.config.model,
+      inputBudgetTokens: this.config.compressionContextBudgetTokens,
+      maxOutputTokens: this.config.compressionMaxTokens,
+      outputReserve: request.config.maxTokens,
+      nativeEstimatedPromptTokens,
+    };
+  }
+
+  private hasExactNativeServedModel(response: NormalizedResponse, requested: string): boolean {
+    const service = response?.raw?.response;
+    const observed = service && typeof service === 'object' && !types.isProxy(service)
+      ? Object.getOwnPropertyDescriptor(service, 'model')?.value : undefined;
+    const model = response?.details?.model;
+    const rounds = model?.perRound;
+    return observed === requested && model?.actual === requested && model.requested === requested &&
+      (rounds === undefined || (Array.isArray(rounds) && rounds.every(round => round?.model === requested)));
+  }
+
+  /** Dispatch-only boundary: commit/disposition/currentness errors cannot trigger routing. */
+  private async attemptNativeMemory(
+    ctx: StrategyContext, request: NormalizedRequest, operation: 'l1' | 'merge' | 'transition',
+    archival: boolean, assertOwner: () => void,
+  ): Promise<{ request: NormalizedRequest; response: NormalizedResponse; route?: NonNullable<SummaryEntry['provenance']>['archivalCyberPolicyFallback']; assertOwner?: () => void }> {
+    assertOwner();
+    let acceptedOwner: (() => void) | undefined;
+    if (archival && request.config.model === 'gpt-6.1-sol' && this.config.archivalCyberPolicyFallbackModel === 'gpt-daybreak-blue-latest') {
+      const ledger = ctx.store.getStateJson(this.compressionRefusalQuarantineLedgerStateId);
+      const generation = Array.isArray(ledger) ? ledger.at(-1)?.eventId : undefined;
+      const batches = ctx.store.getStateJson(this.archivalBatchesStateId);
+      const sealedEndpoint = Array.isArray(batches) ? batches.at(-1)?.throughId : undefined;
+      const queueGeneration = sha256Json(ctx.store.getStateJson(this.mergeQueueStateId) ?? []);
+      const callerOwner = assertOwner;
+      acceptedOwner = assertOwner = () => {
+        callerOwner();
+        const current = ctx.store.getStateJson(this.compressionRefusalQuarantineLedgerStateId);
+        const currentBatches = ctx.store.getStateJson(this.archivalBatchesStateId);
+        if ((Array.isArray(current) ? current.at(-1)?.eventId : undefined) !== generation ||
+            (Array.isArray(currentBatches) ? currentBatches.at(-1)?.throughId : undefined) !== sealedEndpoint ||
+            sha256Json(ctx.store.getStateJson(this.mergeQueueStateId) ?? []) !== queueGeneration) throw new ArchivalNativeOwnerDiscard();
+      };
+    }
+    let response: NormalizedResponse;
+    try {
+      response = await ctx.membrane!.complete(request, { formatter: this.nativeFormatter });
+    } catch (error) {
+      // Guard outside fallback handling: stale state never authorizes another call.
+      assertOwner();
+      if (!archival || request.config.model !== 'gpt-6.1-sol' ||
+          this.config.archivalCyberPolicyFallbackModel !== 'gpt-daybreak-blue-latest' || !isConfirmedCyberPolicy(error)) throw error;
+      const winningRequest: NormalizedRequest = {
+        ...request, config: { ...request.config, model: this.config.archivalCyberPolicyFallbackModel },
+      };
+      // Rebuild only the native-owned tag before formatting. Everything authored
+      // into the selected representation, including reserves, stays byte-identical.
+      this.markArchivalMemoryRequest(winningRequest, operation, true);
+      const requestHash = sha256Json(winningRequest);
+      assertOwner();
+      try {
+        response = await ctx.membrane!.complete(winningRequest, { formatter: this.nativeFormatter, retry: false });
+      } catch (fallbackError) {
+        assertOwner();
+        throw new ArchivalCyberPolicyFallbackHalt(requestHash, 'provider_error', fallbackError);
+      }
+      assertOwner();
+      try {
+        if (!this.hasExactNativeServedModel(response, winningRequest.config.model)) {
+          throw new ArchivalCyberPolicyFallbackHalt(requestHash, 'served_model');
+        }
+        const assessment = this.assessFallbackCompressionResponse(response);
+        if (assessment.outcome !== 'valid') {
+          throw new ArchivalCyberPolicyFallbackHalt(requestHash,
+            assessment.outcome === 'provider_error' ? 'provider_error' : assessment.outcome);
+        }
+        if (!stripThinkingPreamble(assessment.text).trim()) {
+          throw new ArchivalCyberPolicyFallbackHalt(requestHash, 'unusable_empty');
+        }
+        return { request: winningRequest, response, assertOwner: acceptedOwner,
+          route: { primaryModel: 'gpt-6.1-sol', reason: 'cyber_policy' } };
+      } catch (validationError) {
+        if (validationError instanceof ArchivalCyberPolicyFallbackHalt) throw validationError;
+        throw new ArchivalCyberPolicyFallbackHalt(requestHash, 'provider_error', validationError);
+      }
+    }
+    assertOwner();
+    if (archival && request.config.model === 'gpt-6.1-sol' && this.config.archivalCyberPolicyFallbackModel === 'gpt-daybreak-blue-latest' &&
+        !this.hasExactNativeServedModel(response, request.config.model)) throw new MembraneError({
+      type: 'invalid_request', retryable: false, message: 'Archival primary served-model evidence is missing or mismatched', rawError: undefined,
+    });
+    return { request, response, assertOwner: acceptedOwner };
   }
 
   private compressionRequestInputBoundTokens(request: NormalizedRequest): number {
@@ -2956,6 +3189,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     canonicalRequest: NormalizedRequest,
     keptSummaries: SummaryEntry[],
     allMessages: StoredMessage[],
+    carrierDegraded = false,
   ): RecallCurveVariant[] {
     // Alternate curves are allowed to use persisted authored nodes only. Do
     // not trust a merely in-memory node, even though production pushSummary()
@@ -3014,7 +3248,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // a single text block for legacy entries, or verbatim reasoning
       // carriers + text for entries with responseContent. Match by exact
       // JSON equality against that same construction.
-      const expectedBody = JSON.stringify(this.summaryAnswerContent(parent));
+      const parentContent = this.summaryAnswerContent(parent);
+      const expectedBody = JSON.stringify(carrierDegraded ? stripThinkingBlocks(parentContent) : parentContent);
       const pairIndexes: number[] = [];
       for (let i = 0; i < canonicalRequest.messages.length - 1; i++) {
         const header = canonicalRequest.messages[i]!;
@@ -3036,7 +3271,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         {
           participant: canonicalRequest.messages[pairIndexes[0]! + 1]!.participant,
-          content: this.summaryAnswerContent(child),
+          content: carrierDegraded ? stripThinkingBlocks(this.summaryAnswerContent(child)) : this.summaryAnswerContent(child),
         },
       ]);
       const pairIndex = pairIndexes[0]!;
@@ -3049,6 +3284,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ],
       };
       if (!this.validateRecallCurveRequest(request)) continue;
+      const ownedProvenance = canonicalRequest.messages.at(-1)?.metadata?.archivalMemory as { operation: 'l1' | 'merge' } | undefined;
+      if (ownedProvenance) this.markArchivalMemoryRequest(request, ownedProvenance.operation, true);
 
       const leafCoverageHash = sha256Json(childLeaves);
       try {
@@ -3240,12 +3477,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): CompressionQuarantineEvent {
     if (!this.store) throw new Error('Compression quarantine store is not initialized');
     this.requireBranchMutation('appendCompressionQuarantineEvent');
+    this.assertCurrentIfArchival();
     const stored = this.store.appendToStateJsonWithIdentity(
       this.compressionRefusalQuarantineLedgerStateId,
       event,
       'eventId',
       'sequence',
     );
+    if (this.config.archivalCyberPolicyFallbackModel === 'gpt-daybreak-blue-latest') {
+      // This owner authored the event. Advance its generation view before the
+      // next staged event is fenced; other owners keep their stale view.
+      this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
+    }
     return { ...event, eventId: stored.id, sequence: stored.sequence } as CompressionQuarantineEvent;
   }
 
@@ -3309,6 +3552,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       observed?.name === source.name &&
       observed.generation === source.generation &&
       this.compressionBranchGeneration === source.strategyGeneration;
+  }
+
+  /** Telemetry must not attribute an old dispatch to a replacement archival owner. */
+  private canLogCompressionResult(source: CompressionOperationBranch): boolean {
+    if (!this.isCompressionBranchCurrent(source)) return false;
+    try { this.assertCurrentIfArchival(); return true; } catch { return false; }
   }
 
   private logCompressionBranchDiscard(
@@ -3543,6 +3792,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
       if (!this.isCompressionBranchCurrent(source)) return;
+      this.assertCurrentIfArchival();
       const projection = this.readCompressionQuarantineProjection();
       for (const active of projection.values()) {
         if (!this.isCompressionBranchCurrent(source)) return;
@@ -3596,6 +3846,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
       if (!this.isCompressionBranchCurrent(source)) return;
+      this.assertCurrentIfArchival();
       const current = this.readCompressionQuarantineProjection();
       if (current.has(record.key)) return;
       const exhausted = this.appendCompressionQuarantineEvent({
@@ -3659,6 +3910,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     plan: CompressionRefusalPlanRecord[],
     canonicalProviderInputTokens?: number,
     sourceOnlyFallbackRequestHash?: string,
+    admissionFamilyKey?: string,
   ): CompressionRefusalQuarantineRecord {
     const chunkSourceHash = sha256Json(chunk.messages.map((message) => message.id));
     const frontierHash = sha256Json(
@@ -3711,6 +3963,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return {
       key,
       familyKey,
+      ...(admissionFamilyKey && admissionFamilyKey !== familyKey ? { admissionFamilyKey } : {}),
       model,
       chunkSourceHash,
       frontierHash,
@@ -3728,6 +3981,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   protected setMergedInto(entry: SummaryEntry, mergedIntoId: string): void {
     this.requireBranchMutation('setMergedInto');
+    this.assertCurrentIfArchival();
     entry.mergedInto = mergedIntoId;
     if (!this.store) return;
     // Resolve the log position by ID against the PERSISTED array — never by
@@ -3761,6 +4015,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected nextSummaryIdCounter(): number {
     this.requireBranchMutation('nextSummaryIdCounter');
+    this.assertCurrentIfArchival();
     const value = this.summaryIdCounter++;
     this.store?.setStateJson(this.counterStateId, this.summaryIdCounter);
     return value;
@@ -3776,8 +4031,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected enqueueMerge(merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number }): void {
     this.requireBranchMutation('enqueueMerge');
+    const batches = this.store?.getStateJson(this.archivalBatchesStateId);
+    const archival = this.chunkRecords.some(record => record.archival) || (Array.isArray(batches) && batches.length > 0);
+    if (archival) this.assertArchivalStateCurrent();
     if (this.mergeQuarantine.has(sha256Json(merge.sourceIds))) return;
-    this.mergeQueue.push(merge);
+    // A clear/re-enqueue may restore identical source IDs and zero attempts.
+    // Its durable enqueue identity must still differ from an in-flight owner.
+    this.mergeQueue.push(archival ? { ...merge, archivalGeneration: this.store?.currentSequence() } : merge);
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
   }
 
@@ -3786,6 +4046,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected dequeueMerge(): { level: SummaryLevel; sourceIds: string[]; attempts?: number } | undefined {
     this.requireBranchMutation('dequeueMerge');
+    this.assertCurrentIfArchival();
     const merge = this.mergeQueue.shift();
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
     return merge;
@@ -3930,6 +4191,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  entry moves into the durable merge quarantine, health goes critical. */
   protected refuseCrossedMerge(targetLevel: SummaryLevel, sourceIds: string[], reason: string): void {
     this.requireBranchMutation('refuseCrossedMerge');
+    this.assertCurrentIfArchival();
     this.topologyRefusals++;
     const head = this.mergeQueue[0];
     const entry = head && head.sourceIds === sourceIds ? head : { level: targetLevel, sourceIds, attempts: 0 };
@@ -3943,8 +4205,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       lastErrorType: reason,
       quarantinedAt: Date.now(),
     };
-    this.mergeQuarantine.set(record.key, record);
-    this.persistMergeQuarantine();
+    this.persistMergeQuarantine(() => { this.mergeQuarantine.set(record.key, record); });
     console.error(
       `[merge-topology] ⛔ refused L${targetLevel} merge over ${sourceIds.length} source(s) ` +
         `(${sourceIds.join(', ')}): ${reason}. The node was NOT minted; entry quarantined ` +
@@ -4064,6 +4325,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * valid work from the surviving orphan frontier. */
   protected sanitizePersistedMergeQueue(store: MessageStoreView): void {
     if (this.mergeQueue.length === 0) return;
+    this.assertCurrentIfArchival();
     const position = new Map(store.getAll().map((message, index) => [message.id, index] as const));
     const byId = new Map(this.summaries.map((summary) => [summary.id, summary] as const));
     const valid = (merge: { level: SummaryLevel; sourceIds: string[] }): boolean => {
@@ -4107,8 +4369,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     rejection: MergeDispositionRejection,
   ): void {
     this.requireBranchMutation('recordMergeRejection');
+    this.assertCurrentIfArchival();
     if (this.mergeQueue[0] !== merge) return; // queue mutated mid-await; nothing to account
-    merge.attempts = (merge.attempts ?? 0) + 1;
+    const attempts = (merge.attempts ?? 0) + 1;
+    const limit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
+    if (attempts >= limit) {
+      // Dequeue while the mirror still matches persistence; the removed entry
+      // can then receive terminal accounting without dirtying the live queue.
+      this.dequeueMerge();
+      merge.attempts = attempts;
+      this.quarantineMerge(merge, rejection, limit);
+      return;
+    }
+    merge.attempts = attempts;
     if (rejection.stopReason !== undefined) merge.lastStopReason = rejection.stopReason;
     merge.lastOutcome = rejection.outcome;
     // Sticky across the entry's lifetime: once any attempt was classifier-
@@ -4116,12 +4389,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // an intervening rejection had a different stop reason (prevents the
     // raw→refusal→fallback→tool_use→raw oscillation).
     if (rejection.stopReason === 'refusal') merge.hadRefusal = true;
-    const limit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
-    if (merge.attempts >= limit) {
-      this.dequeueMerge();
-      this.quarantineMerge(merge, rejection, limit);
-      return;
-    }
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
     console.warn(
       `[autobiographical] L${merge.level} merge attempt ${merge.attempts}/${limit} rejected ` +
@@ -4136,6 +4403,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     rejection: MergeDispositionRejection,
     limit: number,
   ): void {
+    this.assertCurrentIfArchival();
     const record: MergeQuarantineRecord = {
       key: sha256Json(merge.sourceIds),
       level: merge.level,
@@ -4147,8 +4415,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       lastRequestHash: rejection.requestHash,
       quarantinedAt: Date.now(),
     };
-    this.mergeQuarantine.set(record.key, record);
-    this.persistMergeQuarantine();
+    this.persistMergeQuarantine(() => { this.mergeQuarantine.set(record.key, record); });
     console.error(
       `[merge-quarantine] ⚠️ L${merge.level} merge over ${merge.sourceIds.length} sources ` +
         `quarantined after ${record.attempts} rejected attempt(s) ` +
@@ -4163,7 +4430,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
-  protected persistMergeQuarantine(): void {
+  protected persistMergeQuarantine(update: () => void): void {
+    this.requireBranchMutation('persistMergeQuarantine');
+    this.assertCurrentIfArchival();
+    // Admit against the unmodified mirror, then mutate and persist without an
+    // await. Every producer, operator clear and paid-debt sweep uses this seam.
+    update();
     this.store?.setStateJson(this.mergeQuarantineStateId, [...this.mergeQuarantine.values()]);
   }
 
@@ -4181,13 +4453,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   clearMergeQuarantine(key?: string): void {
     this.requireLoadedBranch('clearMergeQuarantine');
-    if (key !== undefined) {
-      if (!this.mergeQuarantine.delete(key)) return;
-    } else {
-      if (this.mergeQuarantine.size === 0) return;
-      this.mergeQuarantine.clear();
-    }
-    this.persistMergeQuarantine();
+    this.assertCurrentIfArchival();
+    if (key !== undefined ? !this.mergeQuarantine.has(key) : this.mergeQuarantine.size === 0) return;
+    this.persistMergeQuarantine(() => {
+      if (key !== undefined) this.mergeQuarantine.delete(key);
+      else this.mergeQuarantine.clear();
+    });
     console.warn(`[merge-quarantine] cleared ${key ? `key=${key.slice(0, 12)}` : 'ALL records'} — merges eligible for re-enqueue`);
     this.checkMergeThreshold();
   }
@@ -4206,22 +4477,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected sweepPaidOffMergeQuarantine(): void {
     if (this.mergeQuarantine.size === 0) return;
+    this.assertCurrentIfArchival();
     const byId = new Map<string, SummaryEntry>();
     for (const s of this.summaries) byId.set(s.id, s);
-    let swept = 0;
-    for (const [key, record] of [...this.mergeQuarantine]) {
-      const live = record.sourceIds.filter((id) => {
+    const paid: string[] = [];
+    for (const [key, record] of this.mergeQuarantine) {
+      if (record.sourceIds.some(id => {
         const s = byId.get(id);
-        return s !== undefined && !getSummaryParentId(s);
-      });
-      if (live.length !== record.sourceIds.length) {
-        this.mergeQuarantine.delete(key);
-        swept++;
-      }
+        return s === undefined || !!getSummaryParentId(s);
+      })) paid.push(key);
     }
-    if (swept > 0) {
-      this.persistMergeQuarantine();
-      console.warn(`[merge-quarantine] swept ${swept} paid-off/orphaned record(s)`);
+    if (paid.length > 0) {
+      this.persistMergeQuarantine(() => { for (const key of paid) this.mergeQuarantine.delete(key); });
+      console.warn(`[merge-quarantine] swept ${paid.length} paid-off/orphaned record(s)`);
       this.checkMergeThreshold();
     }
   }
@@ -4444,12 +4712,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   checkReadiness(): ReadinessState {
     this.requireLoadedBranch('checkReadiness');
+    this.assertCurrentIfArchival();
     if (this.pendingCompression) {
       return {
         ready: false,
         pendingWork: this.pendingCompression,
         description: `Compressing chunk ${this.compressionQueue[0] ?? '?'}`,
       };
+    }
+
+    const archivalDebt = this.chunks.reduce((count, chunk) => count + Number(chunk.archival === true && !chunk.compressed), 0);
+    const archivalMergeDebt = this.chunkRecords.some(record => record.archival) ? this.mergeQuarantine.size : 0;
+    if (archivalDebt || archivalMergeDebt) {
+      return { ready: false, description: `${archivalDebt} unformed archival chunks + ${archivalMergeDebt} quarantined archival merges` };
     }
 
     const needsCompression = this.chunks.some(
@@ -4601,12 +4876,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the fact) waits; the rebuild after release re-queues it.
       if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
 
-      this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
+      const pending = this.compressChunkHierarchical(chunk, ctx);
+      this.pendingCompression = pending;
 
       try {
-        await this.pendingCompression;
+        await pending;
+      } catch (error) {
+        // A sealed archival boundary remains debt after a provider/commit
+        // failure, even for a caller retrying on this same manager. Live
+        // scheduling policy is unchanged; a replaced branch/chunk owns its
+        // own rebuilt queue and must not receive the old operation's item.
+        if (chunk.archival && !chunk.compressed && this.chunks[chunkIndex] === chunk && !this.compressionQueue.includes(chunkIndex)) {
+          this.compressionQueue.unshift(chunkIndex);
+        }
+        throw error;
       } finally {
-        this.pendingCompression = null;
+        if (this.pendingCompression === pending) this.pendingCompression = null;
       }
       return;
     }
@@ -4628,11 +4913,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
       this._drainProgress++; // executing a merge is real work, even if a
       // follow-on merge gets enqueued and the queue length nets out unchanged
-      this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
+      const pending = this.executeMerge(merge.level, merge.sourceIds, ctx);
+      this.pendingCompression = pending;
 
       try {
-        await this.pendingCompression;
+        await pending;
         if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+        this.assertCurrentIfArchival();
         // Success: drop from head and persist the shorter queue. We
         // re-check that head is still our merge in case some future code
         // path mutates the queue mid-await (today no other site does,
@@ -4641,6 +4928,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.dequeueMerge();
         }
       } catch (error) {
+        // Every merge error path shares the same durable ownership boundary,
+        // before retry accounting or quarantine can mutate persisted debt.
+        if (this.isCompressionBranchCurrent(sourceBranch)) this.assertCurrentIfArchival();
+        if (error instanceof ArchivalCyberPolicyFallbackHalt || error instanceof ArchivalNativeOwnerDiscard) throw error;
         // Terminal-disposition rejection: the LLM answered, but with a
         // refusal / truncation / tool call / empty — bounded-retry policy,
         // not a crash. Anything else (429, network, timeout) keeps the
@@ -4648,6 +4939,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // retries with no attempt accounting.
         if (error instanceof MergeDispositionRejection) {
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          if (error.outcome === 'admission_rejected') {
+            // No provider answered. Keep its existing response-attempt count
+            // and quarantine the mandatory floor with the rejected identity.
+            if (this.mergeQueue[0] !== merge) return;
+            this.dequeueMerge();
+            this.quarantineMerge(merge, error, 0);
+            return;
+          }
           this.recordMergeRejection(merge, error);
           return;
         }
@@ -4662,6 +4961,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // so each retry is a genuinely smaller request. Retryable errors
         // (429, network, timeout) keep the pre-existing rethrow semantics.
         const membraneType = (error as { type?: unknown; retryable?: unknown }) ?? {};
+        // Confirmed provider safety is a terminal stop, not a smaller-request
+        // retry. Preserve the error and queued debt for authorized resolution.
+        if (membraneType.type === 'safety' && membraneType.retryable === false) throw error;
         if (
           error instanceof Error &&
           membraneType.retryable === false &&
@@ -4713,7 +5015,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         throw error;
       } finally {
-        this.pendingCompression = null;
+        if (this.pendingCompression === pending) this.pendingCompression = null;
       }
     }
   }
@@ -5518,17 +5820,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * at dispatch: refused and quarantined attempts are not mints, and a
    * compression context is large enough that storing every rung of a refusal
    * curve would multiply store growth for receipts nobody minted against.
-   * Opt-in: only an explicit `persistMintPreimages: true` enables it, so a
-   * host that never configured it — including one that pulls this version
-   * into a running deployment, and one that passes an unset flag straight
-   * through into the options — writes nothing.
+   * Ordinary live mints remain opt-in. Explicit native archival ownership
+   * preserves accepted request preimages without mutating the hashed profile.
    */
   private persistMintPreimage(
     ctx: StrategyContext,
     request: NormalizedRequest | undefined,
     requestHash: string,
+    archival = false,
   ): void {
-    if (this.config.persistMintPreimages !== true) return;
+    if (!archival && this.config.persistMintPreimages !== true) return;
     if (!request) {
       console.error(
         `[autobiographical] no authoring request retained for accepted mint ${requestHash} — ` +
@@ -5536,7 +5837,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
       return;
     }
+    this.assertCurrentIfArchival();
     persistMintRequestPreimage(ctx.store, request, requestHash);
+    if (archival && this.config.archivalCyberPolicyFallbackModel === 'gpt-daybreak-blue-latest' &&
+        request.config.model === 'gpt-daybreak-blue-latest') {
+      try {
+        if (!getMintRequestPreimageBytes(ctx.store, requestHash)) throw new ArchivalCyberPolicyFallbackHalt(requestHash, 'preimage');
+      } catch (error) {
+        if (error instanceof ArchivalCyberPolicyFallbackHalt || error instanceof ArchivalNativeOwnerDiscard) throw error;
+        throw new ArchivalCyberPolicyFallbackHalt(requestHash, 'preimage', error);
+      }
+    }
   }
 
   /**
@@ -5550,6 +5861,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected async compressChunkHierarchical(chunk: Chunk, ctx: StrategyContext): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
+    this.assertCurrentIfArchival();
+    const memoryTools = chunk.archival ? undefined : ctx.tools;
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
     if (!ctx.membrane) {
       throw new Error('No membrane instance for compression');
@@ -5632,7 +5945,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // compounds through merges (the "68 initiations" incident). Store a
     // mechanical stub without an LLM call instead. Chunks with any
     // non-text blocks (tool cycles, images) are never stubbed.
-    const minChunkChars = this.config.minChunkCharsForLLM ?? 200;
+    const minChunkChars = chunk.archival ? 0 : (this.config.minChunkCharsForLLM ?? 200);
     if (minChunkChars > 0) {
       let substantiveChars = 0;
       let hasNonText = false;
@@ -5835,7 +6148,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // empty set, so no recall pair is emitted below AND buildRecallCurveVariants
     // has no frontier to expand (canonical-only, one call).
     const recallBudget = sourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
-    const { kept: keptSummaries, keptTokens: recallTokens } = this.capRecallPairs(
+    let { kept: keptSummaries, keptTokens: recallTokens } = this.capRecallPairs(
       priorSummaries,
       recallBudget,
     );
@@ -5855,6 +6168,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
+    const recallStartIndex = llmMessages.length;
     for (const s of keptSummaries) {
       llmMessages.push({
         participant: 'Context Manager',
@@ -5874,6 +6188,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content: this.summaryAnswerContent(s),
       });
     }
+
+    const recallEndIndex = llmMessages.length;
 
     // ---- 3. Raw middle ----
     // Any raw messages between the head and the chunk that aren't yet
@@ -5960,11 +6276,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // passes and on every activation, so defer rather than burn the call.
     // Opus-family summarizers mint tools-less (lena bench), and test
     // harnesses never push tools, so the content-independent rule is gated
-    // on the model family.
+    // on the model family. Explicit archival lineages instead require toolless
+    // requests; they do not wait for a live tool surface to become available.
     const chunkHasToolBlocks = cleaned.some(m =>
       m.content.some((b: ContentBlock) => b.type === 'tool_use' || b.type === 'tool_result'));
     const toolsLessRefusingFamily = isToolsLessRefusingSummarizer(this.config.compressionModel ?? "");
-    if ((chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
+    if (!chunk.archival && (chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
       console.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
       return;
     }
@@ -6006,25 +6323,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // image ... kept 0MB" logged while the mint still 400'd on
     // image_input_not_supported). The merge builder has always capped its
     // post-split list; this aligns the L1 builder with it.
-    this.capCompressionImageBytes(
-      cleaned as Array<{ content: ContentBlock[] }>,
-      this.config.maxCompressionImageBytes ??
-        AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+    const { mintMessages, mintSeamed } = this.finishMintMessages(
+      cleaned, keptSummaries, keptSummaries.length < priorSummaries.length,
     );
 
-    // Final wire-shape messages. Sanitize: strip empty text blocks and drop
-    // any message left with no content (empty text reaches the API as a 400
-    // that stalls ALL compression — see the twin note on the request below).
-    const mintMessages = cleaned
-      .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
-      .filter(m => m.content.length > 0);
-    const mintSeamed = this.applyMintCacheSeams(
-      mintMessages,
-      keptSummaries,
-      keptSummaries.length < priorSummaries.length,
-    );
-
-    const request: NormalizedRequest = {
+    let request: NormalizedRequest = {
       // Served FIRST, ahead of the head — the live activation's own layout
       // (system prompt -> head -> middle). Conditionally spread rather than
       // assigned: an undeclared prompt must leave the request shape, its
@@ -6056,7 +6359,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // off rich memories (stop=max_tokens).
         maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5))),
       },
-      // Declare the agent's live tools. A summarizer request that replays
+      // Sealed archival lineages never declare active tools. Ordinary live
+      // memory keeps the agent's tools. A live summarizer request that replays
       // tool_use/tool_result history with NO tools param reads to Anthropic's
       // safety classifier as a foreign agent trace being duplicated ->
       // deterministic reasoning_extraction refusal of every memory-write
@@ -6066,7 +6370,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // workaround. Undefined before the first activation of a session --
       // acceptable: those chunks stay raw and are retried after the agent's
       // first turn (see the defer guard in compressChunkHierarchical).
-      tools: ctx.tools,
+      tools: memoryTools,
+    };
+
+    // Preserve pre-normalization ownership boundaries: collapse can combine a
+    // recall answer with raw context, so fitting never splices the wire list.
+    const requestTemplate = request;
+    const buildL1Request = (retained: SummaryEntry[]): NormalizedRequest => {
+      const selected = [
+        ...llmMessages.slice(0, recallStartIndex),
+        ...retained.flatMap(summary => [
+          { participant: 'Context Manager', content: [{ type: 'text' as const, text: `[CM] Recall memory ${summary.id}.` }] },
+          { participant: agentParticipant, content: this.summaryAnswerContent(summary) },
+        ]),
+        ...llmMessages.slice(recallEndIndex),
+      ];
+      const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(selected)));
+      const { mintMessages, mintSeamed } = this.finishMintMessages(cleaned, retained, retained.length < priorSummaries.length);
+      const { cacheTtl: _previousSeams, ...base } = requestTemplate;
+      return { ...base, messages: mintMessages, ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}) };
     };
 
     let sourceOnlyFallbackRequest: NormalizedRequest | undefined;
@@ -6091,18 +6413,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         shedOversizeImages: true,
         messages: sourceOnlyFallbackWireMessages,
         config: structuredClone(request.config),
-        tools: ctx.tools,
+        tools: memoryTools,
       };
     }
 
-    // Retain the exact normalized canonical request and frontier. Variants are
-    // derived solely by replacing one isolated recall pair; the canonical call
-    // below is always issued first and is never rebuilt through fallback code.
-    const canonicalRequestHash = sha256Json(request);
+    this.markArchivalMemoryRequest(request, 'l1', chunk.archival === true);
+    if (sourceOnlyFallbackRequest) this.markArchivalMemoryRequest(sourceOnlyFallbackRequest, 'l1', chunk.archival === true);
+
+    // The canonical representation is dispatched first. Archival local-cap
+    // refusals may rebuild its optional ladder before any provider response;
+    // refusal-curve variants then derive from its actually retained frontier.
+    let canonicalRequestHash = sha256Json(request);
     const sourceOnlyFallbackRequestHash = sourceOnlyFallbackRequest
       ? sha256Json(sourceOnlyFallbackRequest)
       : undefined;
-    const variants = this.buildRecallCurveVariants(
+    let variants = this.buildRecallCurveVariants(
       request,
       keptSummaries,
       allMessages,
@@ -6120,6 +6445,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       undefined,
       sourceOnlyFallbackRequestHash,
     );
+    const admissionFamilyKey = chunk.archival ? quarantineRecord.familyKey : undefined;
     const durableQuarantine = this.readCompressionQuarantineProjection();
     // Bounded by chunk hash, not just request identity (2026-08-06
     // ear-loop): as sibling chunks mint, the recall frontier shifts, so
@@ -6151,7 +6477,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sha256Json(quarantineRecord.normalizedConfig.toolProseFallback ?? null),
     );
     const durableActive = durableQuarantine.get(quarantineRecord.key)
-      ?? sameRegime.find((active) => active.record.familyKey === quarantineRecord.familyKey)
+      ?? sameRegime.find((active) => active.record.familyKey === quarantineRecord.familyKey ||
+        active.record.admissionFamilyKey === admissionFamilyKey && admissionFamilyKey !== undefined)
       ?? (sameRegime.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameRegime[0] : undefined);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
@@ -6217,6 +6544,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logSummaryId: string | undefined;
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
+    let acceptedAttemptOwner: (() => void) | undefined;
     let splitMeta: Record<string, unknown> | undefined;
     let inFlightError: unknown;
     /**
@@ -6230,12 +6558,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
      * compression log.
      */
     const attemptRequestsByHash = new Map<string, NormalizedRequest>();
+    let attemptRoutesByHash: Map<string, NonNullable<NonNullable<SummaryEntry['provenance']>['archivalCyberPolicyFallback']>> | undefined;
     /** Split-stitch only: the accepted request hash of every fold part, so a
      *  stitched mint persists each leaf's preimage (its own `requestHash` is
      *  a composite over the parts, not a request). */
     let stitchedFoldRequestHashes: string[] | undefined;
+    let lastAttemptRequest = request;
+    let lastAttemptRecall = keptSummaries;
+    let lastAttemptCarrierDegraded = false;
+    let canonicalCarrierDegraded = false;
+    let lastAdmissionRequest: NormalizedRequest | undefined;
+    let lastAdmissionRecall: SummaryEntry[] = [];
+    const recallById = this.persistedCanonicalSummariesById();
+    const messagePosition = new Map(allMessages.map((message, index) => [message.id, index]));
+    const coverageHashFor = (retained: SummaryEntry[]): string => sha256Json(retained.flatMap(
+      summary => this.recallCurveLeafIds(summary, recallById, messagePosition) ?? [],
+    ).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0)));
+    const buildCanonicalRequest = (retained: SummaryEntry[]): NormalizedRequest => {
+      const rebuilt = buildL1Request(retained);
+      return canonicalCarrierDegraded ? stripReasoningFromRequest(rebuilt) : rebuilt;
+    };
 
     try {
+      const assertDispatchOwner = (): void => {
+        if (!this.isCompressionBranchCurrent(sourceBranch)) {
+          throw Object.assign(new Error('Compression dispatch crossed a branch boundary'), { name: 'CompressionBranchDiscard' });
+        }
+        this.assertCurrentIfArchival();
+      };
       const runAttempt = async (
         attemptRequest: NormalizedRequest,
         curveLabel: string,
@@ -6244,50 +6594,79 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         leafCoverageHash: string,
         expandedParentId?: string,
         expandedChildIds?: string[],
+        fit?: { retained: SummaryEntry[]; build: (retained: SummaryEntry[]) => NormalizedRequest },
       ): Promise<unknown> => {
         const started = Date.now();
         let response: unknown;
-        // The request the transport ACCEPTED, which is the one that authored
-        // whatever comes back. It is `attemptRequest` unless the carrier
-        // fallback below fires, in which case the transport REFUSED those
-        // bytes and the stripped copy is the authoring request. Everything
-        // downstream — trace hash, the accepted-request map, the persisted
-        // preimage — keys off this, so a summary's provenance never names a
-        // request the model never saw (sol review, 2026-08-24).
+        let retained = fit?.retained ?? [];
+        let carrierDegraded = false;
         let acceptedRequest = attemptRequest;
-        try {
-          response = await ctx.membrane!.complete(
-            attemptRequest,
-            { formatter: this.nativeFormatter },
-          );
-        } catch (error) {
-          // Degraded mode: the transport rejected the carrier blocks
-          // themselves (invalid_request about thinking — never a refusal).
-          // Retry this attempt once with text-only recall pairs, loudly.
-          if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
-            throw error;
+        for (;;) {
+          assertDispatchOwner();
+          this.markArchivalMemoryRequest(acceptedRequest, 'l1', chunk.archival === true);
+          if (chunk.archival) {
+            lastAttemptRequest = acceptedRequest;
+            lastAttemptRecall = retained;
           }
-          console.error(
-            `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
-              `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
-          );
-          logCompressionCall({
-            event: 'compression:carrier-transport-fallback',
-            operation: 'compress_l1',
-            metadata: { curveLabel, error: String(error).slice(0, 300) },
-          });
-          acceptedRequest = stripReasoningFromRequest(attemptRequest);
-          response = await ctx.membrane!.complete(
-            acceptedRequest,
-            { formatter: this.nativeFormatter },
-          );
+          try {
+            const attempt = await this.attemptNativeMemory(ctx, acceptedRequest, 'l1', chunk.archival === true, assertDispatchOwner);
+            response = attempt.response;
+            acceptedRequest = attempt.request;
+            acceptedAttemptOwner = attempt.assertOwner;
+            if (attempt.route) {
+              attemptRoutesByHash ??= new Map();
+              attemptRoutesByHash.set(sha256Json(acceptedRequest), attempt.route);
+            }
+          } catch (error) {
+            // An awaited LOCAL refusal crosses the same ownership boundary as
+            // a provider response, before logging, rebuilding or recording debt.
+            assertDispatchOwner();
+            if (error instanceof ArchivalCyberPolicyFallbackHalt || error instanceof ArchivalNativeOwnerDiscard) throw error;
+            if (chunk.archival && isArchivalLocalCap(error)) {
+              const requestHash = sha256Json(acceptedRequest);
+              const trace: CompressionAttemptTrace = {
+                curveLabel, recallIds: retained.map(s => s.id), recallLevels: retained.map(s => s.level),
+                leafCoverageHash: coverageHashFor(retained), requestHash,
+                messageCount: acceptedRequest.messages.length,
+                estimatedTokens: this.estimateCompressionRequestTokens(acceptedRequest),
+                latencyMs: Date.now() - started, persisted: false, outcome: 'admission_rejected',
+                errorType: ARCHIVAL_MEMORY_LOCAL_CAP_CODE,
+              };
+              attemptTraces.push(trace);
+              lastAdmissionRequest = acceptedRequest;
+              lastAdmissionRecall = retained;
+              logCompressionCall({ event: 'compression:admission-refit', operation: 'compress_l1', metadata: {
+                ...trace, disposition: retained.length ? 'drop_oldest_optional_recall' : 'mandatory_floor',
+              } });
+              if (!fit || retained.length === 0) throw new ArchivalAdmissionRejection(requestHash);
+              retained = retained.slice(1);
+              acceptedRequest = fit.build(retained);
+              if (carrierDegraded) acceptedRequest = stripReasoningFromRequest(acceptedRequest);
+              continue;
+            }
+            if (carrierDegraded || !isCarrierTransportRejection(error, chunk.archival === true) || !requestCarriesReasoning(acceptedRequest)) throw error;
+            const safeError = chunk.archival ? 'reasoning carrier rejected' : String(error).slice(0, 300);
+            console.error(`[autobiographical] transport rejected reasoning carriers on '${curveLabel}' — retrying ONCE with text-only recall pairs (degraded mode)`);
+            logCompressionCall({ event: 'compression:carrier-transport-fallback', operation: 'compress_l1', metadata: { curveLabel, error: safeError } });
+            carrierDegraded = true;
+            acceptedRequest = stripReasoningFromRequest(acceptedRequest);
+            continue;
+          }
+          assertDispatchOwner();
+          break;
         }
-        if (!this.isCompressionBranchCurrent(sourceBranch)) {
-          this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
-          throw Object.assign(new Error('Compression result crossed a branch boundary'), {
-            name: 'CompressionBranchDiscard',
-          });
+        if (chunk.archival && fit) {
+          recallIds = retained.map(s => s.id);
+          recallLevels = retained.map(s => s.level);
+          leafCoverageHash = coverageHashFor(retained);
+          if (expandedChildIds) {
+            expandedChildIds = expandedChildIds.filter(id => recallIds.includes(id));
+            if (!expandedChildIds.length) expandedParentId = undefined;
+          }
         }
+        lastAttemptRequest = acceptedRequest;
+        lastAttemptRecall = retained;
+        lastAttemptCarrierDegraded = carrierDegraded;
         const stopReason = this.compressionResponseStopReason(response);
         const trace: CompressionAttemptTrace = {
           curveLabel,
@@ -6312,20 +6691,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return response;
       };
 
-      const summariesById = this.persistedCanonicalSummariesById();
-      const messagePosition = new Map(allMessages.map((message, index) => [message.id, index]));
-      const canonicalLeafIds = keptSummaries.flatMap(
-        (summary) => this.recallCurveLeafIds(summary, summariesById, messagePosition) ?? [],
-      ).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0));
-      const canonicalCoverageHash = sha256Json(canonicalLeafIds);
+      let canonicalCoverageHash = coverageHashFor(keptSummaries);
       let response = await runAttempt(
         request,
         'canonical',
         keptSummaries.map((summary) => summary.id),
         keptSummaries.map((summary) => summary.level),
         canonicalCoverageHash,
+        undefined, undefined,
+        chunk.archival ? { retained: keptSummaries, build: buildL1Request } : undefined,
       );
+      assertDispatchOwner();
       successfulTrace = attemptTraces[attemptTraces.length - 1];
+      if (chunk.archival) {
+        // Refusal planning and later rungs start from the actually admitted
+        // canonical request, never from an evicted recall frontier.
+        request = lastAttemptRequest;
+        keptSummaries = lastAttemptRecall;
+        canonicalCarrierDegraded = lastAttemptCarrierDegraded;
+        recallTokens = this.capRecallPairs(keptSummaries, Infinity).keptTokens;
+        canonicalRequestHash = sha256Json(request);
+        canonicalCoverageHash = successfulTrace!.leafCoverageHash;
+        variants = this.buildRecallCurveVariants(request, keptSummaries, allMessages, canonicalCarrierDegraded);
+        fallbackPlan = this.compressionRefusalPlan(request, variants);
+        quarantineRecord = this.compressionRefusalQuarantineRecord(
+          chunk, model, canonicalRequestHash, request, keptSummaries, variants, fallbackPlan,
+          undefined, sourceOnlyFallbackRequestHash, admissionFamilyKey,
+        );
+      }
+      const canonicalTrace = successfulTrace!;
 
       // Terminal-disposition gate (2026-08-01): only a complete `end_turn`
       // may proceed toward persistence. A refusal takes the curve-fallback
@@ -6353,7 +6747,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           keptSummaries.map((summary) => summary.id),
           keptSummaries.map((summary) => summary.level),
           canonicalCoverageHash,
+          undefined, undefined,
+          chunk.archival ? { retained: keptSummaries, build: retained => withNoToolsLine(buildCanonicalRequest(retained)) } : undefined,
         );
+        assertDispatchOwner();
         let retryStopReason = this.compressionResponseStopReason(retryResponse);
         if (retryStopReason === 'end_turn') {
           response = retryResponse;
@@ -6371,7 +6768,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             keptSummaries.map((summary) => summary.id),
             keptSummaries.map((summary) => summary.level),
             canonicalCoverageHash,
+            undefined, undefined,
+            chunk.archival ? { retained: keptSummaries, build: retained => withoutToolsParam(withNoToolsLine(buildCanonicalRequest(retained))) } : undefined,
           );
+          assertDispatchOwner();
           if (this.compressionResponseStopReason(toolslessResponse) === 'end_turn') {
             response = toolslessResponse;
             canonicalStopReason = 'end_turn';
@@ -6398,6 +6798,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           fallbackPlan,
           canonicalProviderInputTokens,
           sourceOnlyFallbackRequestHash,
+          admissionFamilyKey,
         );
         const outcomes: CompressionRefusalOutcomeRecord[] = [{
           curveLabel: 'canonical',
@@ -6405,14 +6806,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           outcome: canonicalOutcome,
           ...(canonicalStopReason !== undefined ? { stopReason: canonicalStopReason } : {}),
         }];
-        attemptTraces[0]!.outcome = canonicalOutcome;
+        canonicalTrace.outcome = canonicalOutcome;
         successfulTrace = undefined;
         logCompressionCall({
           event: canonicalOutcome === 'refusal'
             ? 'compression:canonical-refused'
             : 'compression:canonical-incomplete',
           operation: 'compress_l1',
-          metadata: attemptTraces[0],
+          metadata: canonicalTrace,
         });
         let fallbackResponse: NormalizedResponse | undefined;
 
@@ -6427,7 +6828,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ): Promise<void> => {
           const requestHash = sha256Json(hoistedRequest);
           try {
-            const rungResponse = await runAttempt(hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash);
+            const retained = recallIds.map(id => recallById.get(id)).filter((s): s is SummaryEntry => !!s);
+            const rungResponse = await runAttempt(hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash,
+              undefined, undefined,
+              chunk.archival && retained.length ? { retained, build: summaries => this.toolProseHoistedRequest(buildCanonicalRequest(summaries))! } : undefined,
+            );
+            assertDispatchOwner();
             const trace = attemptTraces[attemptTraces.length - 1]!;
             const assessment = this.assessFallbackCompressionResponse(rungResponse);
             if (assessment.outcome === 'valid') {
@@ -6438,20 +6844,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             } else {
               trace.outcome = assessment.outcome;
               outcomes.push({
-                curveLabel, requestHash, outcome: assessment.outcome,
+                curveLabel, requestHash: trace.requestHash, outcome: assessment.outcome,
                 ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
                 ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
               });
             }
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
           } catch (error) {
-            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            if (error instanceof ArchivalCyberPolicyFallbackHalt || error instanceof ArchivalNativeOwnerDiscard || error instanceof ArchivalAdmissionRejection || (error instanceof Error && error.name === 'CompressionBranchDiscard')) throw error;
+            assertDispatchOwner();
             const errorType = error && typeof error === 'object' && 'type' in error
               ? String((error as { type: unknown }).type)
               : error instanceof Error ? error.name : typeof error;
             const trace = attemptTraces[attemptTraces.length - 1];
-            if (trace?.curveLabel === curveLabel) { trace.outcome = 'provider_error'; trace.errorType = errorType; }
-            outcomes.push({ curveLabel, requestHash, outcome: 'provider_error', errorType });
+            if (trace?.curveLabel === curveLabel && trace.outcome !== 'admission_rejected') { trace.outcome = 'provider_error'; trace.errorType = errorType; }
+            outcomes.push({ curveLabel, requestHash: chunk.archival ? sha256Json(lastAttemptRequest) : requestHash, outcome: 'provider_error', errorType });
           }
         };
 
@@ -6473,6 +6880,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               keptSummaries.map((summary) => summary.level),
               canonicalCoverageHash,
             );
+            assertDispatchOwner();
           }
         }
 
@@ -6533,9 +6941,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               variant.leafCoverageHash,
               variant.parent.id,
               variant.children.map((child) => child.id),
+              chunk.archival ? { retained: variantFrontier, build: buildCanonicalRequest } : undefined,
             );
+            assertDispatchOwner();
           } catch (error) {
-            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            if (error instanceof ArchivalCyberPolicyFallbackHalt || error instanceof ArchivalNativeOwnerDiscard || error instanceof ArchivalAdmissionRejection || (error instanceof Error && error.name === 'CompressionBranchDiscard')) throw error;
+            this.assertCurrentIfArchival();
             if (!this.isCompressionBranchCurrent(sourceBranch)) {
               this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:error`, quarantineRecord);
               throw Object.assign(new Error('Compression error crossed a branch boundary'), {
@@ -6545,16 +6956,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const errorType = error && typeof error === 'object' && 'type' in error
               ? String((error as { type: unknown }).type)
               : error instanceof Error ? error.name : typeof error;
+            const failedRequest = chunk.archival ? lastAttemptRequest : variant.request;
+            const failedFrontier = chunk.archival ? lastAttemptRecall : variantFrontier;
+            const failedChildren = variant.children.filter(child => failedFrontier.some(summary => summary.id === child.id));
             const trace: CompressionAttemptTrace = {
               curveLabel,
-              recallIds: variantFrontier.map((summary) => summary.id),
-              recallLevels: variantFrontier.map((summary) => summary.level),
-              expandedParentId: variant.parent.id,
-              expandedChildIds: variant.children.map((child) => child.id),
-              leafCoverageHash: variant.leafCoverageHash,
-              requestHash: variant.requestHash,
-              messageCount: variant.request.messages.length,
-              estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
+              recallIds: failedFrontier.map((summary) => summary.id),
+              recallLevels: failedFrontier.map((summary) => summary.level),
+              ...(failedChildren.length ? { expandedParentId: variant.parent.id, expandedChildIds: failedChildren.map(child => child.id) } : {}),
+              leafCoverageHash: chunk.archival ? coverageHashFor(failedFrontier) : variant.leafCoverageHash,
+              requestHash: chunk.archival ? sha256Json(failedRequest) : variant.requestHash,
+              messageCount: failedRequest.messages.length,
+              estimatedTokens: this.estimateCompressionRequestTokens(failedRequest),
               latencyMs: 0,
               persisted: false,
               outcome: 'provider_error',
@@ -6565,7 +6978,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             attemptTraces.push(trace);
             outcomes.push({
               curveLabel,
-              requestHash: variant.requestHash,
+              requestHash: trace.requestHash,
               outcome: 'provider_error',
               errorType,
               admittedTokens,
@@ -6589,7 +7002,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             trace.outcome = 'refusal';
             outcomes.push({
               curveLabel,
-              requestHash: variant.requestHash,
+              requestHash: trace.requestHash,
               outcome: 'refusal',
               stopReason: assessment.stopReason,
               admittedTokens,
@@ -6602,7 +7015,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
             outcomes.push({
               curveLabel,
-              requestHash: variant.requestHash,
+              requestHash: trace.requestHash,
               outcome: assessment.outcome,
               stopReason: assessment.stopReason,
               ...(assessment.outcome === 'provider_error'
@@ -6635,6 +7048,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               sourceOnlyFallbackRequest, curveLabel, [], [],
               sha256Json(chunk.messages.map((message) => message.id)),
             );
+            assertDispatchOwner();
             const trace = attemptTraces[attemptTraces.length - 1]!;
             const assessment = this.assessFallbackCompressionResponse(sourceOnlyResponse);
             if (assessment.outcome === 'valid') {
@@ -6646,20 +7060,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               sourceOnlyOutcome = assessment.outcome;
               trace.outcome = assessment.outcome;
               outcomes.push({
-                curveLabel, requestHash, outcome: assessment.outcome,
+                curveLabel, requestHash: trace.requestHash, outcome: assessment.outcome,
                 ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
                 ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
               });
             }
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
           } catch (error) {
-            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            if (error instanceof ArchivalCyberPolicyFallbackHalt || error instanceof ArchivalNativeOwnerDiscard || error instanceof ArchivalAdmissionRejection || (error instanceof Error && error.name === 'CompressionBranchDiscard')) throw error;
+            assertDispatchOwner();
             const errorType = error && typeof error === 'object' && 'type' in error
               ? String((error as { type: unknown }).type)
               : error instanceof Error ? error.name : typeof error;
             const trace = attemptTraces[attemptTraces.length - 1];
-            if (trace?.curveLabel === curveLabel) { trace.outcome = 'provider_error'; trace.errorType = errorType; }
-            outcomes.push({ curveLabel, requestHash, outcome: 'provider_error', errorType });
+            if (trace?.curveLabel === curveLabel && trace.outcome !== 'admission_rejected') { trace.outcome = 'provider_error'; trace.errorType = errorType; }
+            outcomes.push({ curveLabel, requestHash: chunk.archival ? sha256Json(lastAttemptRequest) : requestHash, outcome: 'provider_error', errorType });
             sourceOnlyOutcome = 'provider_error';
           }
         }
@@ -6677,6 +7092,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               [], [],
               sha256Json(chunk.messages.map((message) => message.id)),
             );
+            assertDispatchOwner();
           }
         }
 
@@ -6714,7 +7130,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               shedOversizeImages: true,
               messages: cleaned.map((m) => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) })).filter((m) => m.content.length > 0),
               config: structuredClone(request.config),
-              tools: ctx.tools,
+              tools: memoryTools,
             } as NormalizedRequest;
           };
           type SplitPart = { range: [number, number]; kind: 'fold' | 'placeholder'; tokens: number; inputTokens?: number; requestHash?: string; responseContentHash?: string; contentHash: string; text: string };
@@ -6753,9 +7169,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             let res: unknown;
             try {
               res = await runAttempt(sub, label, [], [], leafHash);
+              assertDispatchOwner();
             } catch (error) {
+              if (error instanceof ArchivalCyberPolicyFallbackHalt || error instanceof ArchivalNativeOwnerDiscard || error instanceof ArchivalAdmissionRejection || (error instanceof Error && error.name === 'CompressionBranchDiscard')) throw error;
               attempted.errors++;
-              if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+              this.assertCurrentIfArchival();
               abortReason = `provider-error:${error instanceof Error ? error.name : typeof error}`;
               return false;
             }
@@ -6797,6 +7215,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               if (cuts.length === 0) return false; // the whole range is one indivisible tool round
               const cut = cuts.reduce((best, c) => (Math.abs(c - midWish) < Math.abs(best - midWish) ? c : best), cuts[0]);
               const left = await fold(a, cut);
+              assertDispatchOwner();
               if (!left) return false;
               return fold(cut + 1, b);
             }
@@ -6809,6 +7228,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return true;
           };
           const complete = await fold(0, chunk.messages.length - 1, false);
+          assertDispatchOwner();
           this.lastSplitAttempted = { ...attempted, complete };
           if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
             const stitchedText = parts.map((p) => p.text).join('\n\n');
@@ -6872,7 +7292,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return;
           }
           await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, outcomes);
-          if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          assertDispatchOwner();
           logCompressionCall({
             event: 'compression:curve-exhausted',
             operation: 'compress_l1',
@@ -6927,7 +7347,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           keptSummaries.map((summary) => summary.id),
           keptSummaries.map((summary) => summary.level),
           canonicalCoverageHash,
+          undefined, undefined,
+          chunk.archival ? { retained: keptSummaries, build: retained => withPlainProseLine(buildCanonicalRequest(retained)) } : undefined,
         );
+        assertDispatchOwner();
         if (this.compressionResponseStopReason(proseResponse) === 'end_turn') {
           const proseText = extractSummaryText(proseResponse as NormalizedResponse);
           if (proseText.trim()) {
@@ -6979,6 +7402,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
 
+      this.assertCurrentIfArchival();
+
       // A compression hold placed while the request was in flight: the
       // summary may be built from provisional content. Discard it; the chunk
       // stays uncompressed and is re-queued when the hold is released.
@@ -7001,7 +7426,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
 
+      acceptedAttemptOwner?.();
       const messageIds = chunk.messages.map(m => m.id);
+      const acceptedRoute = successfulTrace ? attemptRoutesByHash?.get(successfulTrace.requestHash) : undefined;
       const entry: SummaryEntry = {
         id: `L1-${this.nextSummaryIdCounter()}`,
         level: 1,
@@ -7036,7 +7463,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               provenance: {
                 stopReason: successfulTrace.stopReason ?? 'end_turn',
                 requestHash: successfulTrace.requestHash,
-                model,
+                model: chunk.archival && this.config.archivalCyberPolicyFallbackModel ? acceptedResponse.details?.model.actual ?? model : model,
+                ...(acceptedRoute ? { archivalCyberPolicyFallback: acceptedRoute } : {}),
               },
             }
           : {}),
@@ -7049,15 +7477,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // requests that authored it are the fold leaves, each accepted through
         // `runAttempt` and readable under the hash its part records.
         for (const foldHash of stitchedFoldRequestHashes) {
-          this.persistMintPreimage(ctx, attemptRequestsByHash.get(foldHash), foldHash);
+          this.persistMintPreimage(ctx, attemptRequestsByHash.get(foldHash), foldHash, chunk.archival === true);
         }
       } else if (successfulTrace) {
         this.persistMintPreimage(
           ctx,
           attemptRequestsByHash.get(successfulTrace.requestHash),
           successfulTrace.requestHash,
+          chunk.archival === true,
         );
       }
+      acceptedAttemptOwner?.();
       this.pushSummary(entry);
       chunk.compressed = true;
       chunk.summaryId = entry.id;
@@ -7081,17 +7511,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.checkMergeThreshold();
     } catch (error) {
       if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;
-      if (!this.isCompressionBranchCurrent(sourceBranch)) {
-        this.logCompressionBranchDiscard(sourceBranch, 'canonical_error', quarantineRecord);
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      this.assertCurrentIfArchival();
+      if (error instanceof ArchivalCyberPolicyFallbackHalt || error instanceof ArchivalNativeOwnerDiscard) {
+        logError = error.message;
+        inFlightError = error;
+        throw error;
+      }
+      if (error instanceof ArchivalAdmissionRejection && lastAdmissionRequest) {
+        logError = error.message;
+        quarantineRecord = this.compressionRefusalQuarantineRecord(
+          chunk, model, error.requestHash, lastAdmissionRequest, lastAdmissionRecall, [], [],
+          undefined, sourceOnlyFallbackRequestHash, admissionFamilyKey,
+        );
+        await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, [{
+          curveLabel: attemptTraces.at(-1)?.curveLabel ?? 'canonical',
+          requestHash: error.requestHash, outcome: 'admission_rejected', errorType: ARCHIVAL_MEMORY_LOCAL_CAP_CODE,
+        }]);
         return;
       }
-      console.error('Failed to compress chunk (hierarchical):', error);
-      logError = error instanceof Error ? error.message : String(error);
+      logError = chunk.archival
+        ? `Archival memory dispatch failed [${sha256Json(error instanceof Error ? error.message : String(error)).slice(0, 16)}]; work remains resumable`
+        : error instanceof Error ? error.message : String(error);
+      console.error('Failed to compress chunk (hierarchical):', chunk.archival ? logError : error);
       inFlightError = error;
       throw error;
     } finally {
       settleInFlight({ ...(inFlightError !== undefined ? { error: inFlightError } : {}) });
       if (inFlight.get(inFlightKey) === inFlightCompletion) inFlight.delete(inFlightKey);
+      if (this.canLogCompressionResult(sourceBranch)) {
+      const loggedRequest = (successfulTrace ? attemptRequestsByHash.get(successfulTrace.requestHash) : undefined)
+        ?? lastAttemptRequest;
+      const loggedRecall = successfulTrace
+        ? successfulTrace.recallIds.map(id => recallById.get(id)).filter((s): s is SummaryEntry => !!s)
+        : chunk.archival ? lastAttemptRecall : keptSummaries;
       for (const trace of attemptTraces) {
         logCompressionCall({
           event: 'compression:attempt',
@@ -7118,14 +7571,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // system field, so the pre-threading log shape is preserved exactly;
         // summarized (not verbatim) when it did, matching how `messages` is
         // logged.
-        system: request.system ? summarizeTelemetryText(request.system) : null,
-        messages: summarizeTelemetryMessages(cleaned),
+        system: loggedRequest.system ? summarizeTelemetryText(loggedRequest.system) : null,
+        messages: summarizeTelemetryMessages(loggedRequest.messages),
         metadata: {
+          request_hash: sha256Json(loggedRequest),
+          recall_ids: loggedRecall.map(s => s.id),
           chunk_message_ids: chunk.messages.map((m) => m.id),
           chunk_size: chunk.messages.length,
           prior_summary_count: priorSummaries.length,
-          prior_summary_count_kept: keptSummaries.length,
-          prior_summary_tokens: recallTokens,
+          prior_summary_count_kept: loggedRecall.length,
+          prior_summary_tokens: this.capRecallPairs(loggedRecall, Infinity).keptTokens,
           has_doc_context: docContext !== null,
           doc_context: docContext,
           target_tokens: targetTokens,
@@ -7136,6 +7591,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         response: summarizeTelemetryText(logResponse),
         error: logError,
       });
+      }
     }
   }
 
@@ -7367,6 +7823,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     ctx: StrategyContext
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('executeMerge');
+    this.assertCurrentIfArchival();
     if (!ctx.membrane) {
       throw new Error('No membrane instance for merge');
     }
@@ -7464,6 +7921,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     };
     for (const src of sources) collectLeaves(src);
+    const archivalLineage = this.chunkRecords.some(record => record.archival && record.sourceIds.some(id => sourceLeafIds.has(id)));
+    const memoryTools = archivalLineage ? undefined : ctx.tools;
 
     // Find the start of the merge range in the message store.
     const mergeFirstMsgId = sources[0].sourceRange.first;
@@ -7578,7 +8037,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `${configuredRecallBudget} -> ${mergeRecallBudget} tokens (halved per failed attempt)`,
       );
     }
-    const { kept: keptPriorSummaries, keptTokens: mergeRecallTokens } = this.capRecallPairs(
+    let { kept: keptPriorSummaries, keptTokens: mergeRecallTokens } = this.capRecallPairs(
       priorSummariesAll,
       mergeRecallBudget,
     );
@@ -7602,6 +8061,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (Leaf coverage `priorSummaryMessageIds` is computed above, before
     // the head emission — shared by the head loop and the raw middle.)
 
+    const recallStartIndex = llmMessages.length;
     for (const s of keptPriorSummaries) {
       llmMessages.push({
         participant: 'Context Manager',
@@ -7614,6 +8074,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
+    const recallEndIndex = llmMessages.length;
+
     // Raw middle: any messages between the head window and the merge
     // range that aren't covered by a prior summary or the merge tree.
     // Usually empty (chunking is contiguous).
@@ -7625,6 +8087,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
       }
     }
+
+    const targetStartIndex = llmMessages.length;
 
     // ---- 2. TARGET: expand sources one level deeper ----
     // For L2 (sources at L1, sourceLevel=0): expand to raw L0 messages.
@@ -7700,10 +8164,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
+    const targetEndIndex = llmMessages.length;
+    let sourceRecollections = refusalFallback;
+    let representationDisposition = refusalFallback ? 'model_refusal' : 'deeper';
+
     // ---- 3. INSTRUCTION ----
-    // sourceLevelShown is the level of content the model actually sees
-    // (one level below the sources themselves).
-    const sourceLevelShown =
+    // Both instruction and evidence name the representation actually shown.
+    let sourceLevelShown = refusalFallback ? sources[0].level :
       sources[0].sourceLevel === 0 ? 0 : sources[0].level - 1;
 
     // Reading-mode detection: when ALL the merge's leaf messages are
@@ -7752,11 +8219,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             )
           : this.getMergeInstruction(targetLevel, sources, targetTokens),
     );
+    let mergeInstructionSuffix = '';
     if (mergeSourceOnly) {
-      mergeInstructionText += '\n\nAttribution discipline: preserve who made each claim. Do not turn another participant’s diagnosis, promise, operational status, or forecast into your own first-person fact unless the source includes your own direct confirmation. Preserve corrections and uncertainty explicitly.';
+      mergeInstructionSuffix += '\n\nAttribution discipline: preserve who made each claim. Do not turn another participant’s diagnosis, promise, operational status, or forecast into your own first-person fact unless the source includes your own direct confirmation. Preserve corrections and uncertainty explicitly.';
     }
     // Retry-only no-tools line. The summarizer request declares the agent's
-    // live tools (classifier requirement, see `tools: ctx.tools` below), and
+    // live tools except on archival lineages (see `memoryTools` below), and
     // a model whose recent spans are tool-heavy can answer the merge prompt
     // on-pattern — a `think` call carrying the summary draft, which the
     // single-shot compression path cannot continue past (lena 2026-08-04:
@@ -7773,7 +8241,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       console.warn(
         `[autobiographical] L${targetLevel} merge retry after tool_use rejection — appending no-tools instruction`,
       );
-      mergeInstructionText += NO_TOOLS_RETRY_LINE;
+      mergeInstructionSuffix += NO_TOOLS_RETRY_LINE;
     }
     // Retry rung for thinking-wrapped generations: an unusable_empty whose
     // text was all <thinking> preamble fails identically on every bare
@@ -7786,8 +8254,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       console.warn(
         `[autobiographical] L${targetLevel} merge retry after empty generation — appending plain-prose instruction`,
       );
-      mergeInstructionText += PLAIN_PROSE_RETRY_LINE;
+      mergeInstructionSuffix += PLAIN_PROSE_RETRY_LINE;
     }
+    mergeInstructionText += mergeInstructionSuffix;
     llmMessages.push({
       participant: 'Context Manager',
       content: [{
@@ -7806,24 +8275,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // messages under its L1s, images and all (including screenshots nested in
     // tool_results). This is the path that kept tripping membrane's transport
     // shed at 27MB after the L1 site was already capped. Own it here.
-    this.capCompressionImageBytes(
-      cleaned as Array<{ content: ContentBlock[] }>,
-      this.config.maxCompressionImageBytes ??
-        AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
-    );
-
-    // Final wire-shape messages. Sanitize: strip empty text blocks and drop
-    // any message left with no content (empty text reaches the API as a 400
-    // that stalls ALL compression — see the twin note on the request below).
-    // Seams count only `keptPriorSummaries` pairs as stable prefix — the
-    // expanded SOURCE pairs below the prior ladder are this merge's payload.
-    const mintMessages = cleaned
-      .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
-      .filter(m => m.content.length > 0);
-    const mintSeamed = this.applyMintCacheSeams(
-      mintMessages,
-      keptPriorSummaries,
-      keptPriorSummaries.length < priorSummariesAll.length,
+    // Only retained PRIOR pairs are cache-stable; source pairs are payload.
+    const { mintMessages, mintSeamed } = this.finishMintMessages(
+      cleaned, keptPriorSummaries, keptPriorSummaries.length < priorSummariesAll.length,
     );
 
     // The HOST's system prompt, or none — same rationale as
@@ -7868,7 +8322,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // off rich memories (stop=max_tokens).
         maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5))),
       },
-      // Declare the agent's live tools. A summarizer request that replays
+      // Sealed archival lineages never declare active tools. Ordinary live
+      // memory keeps the agent's tools. A live summarizer request that replays
       // tool_use/tool_result history with NO tools param reads to Anthropic's
       // safety classifier as a foreign agent trace being duplicated ->
       // deterministic reasoning_extraction refusal of every memory-write
@@ -7878,7 +8333,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // workaround. Undefined before the first activation of a session --
       // acceptable: those chunks stay raw and are retried after the agent's
       // first turn (see the defer guard in compressChunkHierarchical).
-      tools: ctx.tools,
+      tools: memoryTools,
+    };
+
+    const buildMergeRequest = (retained: SummaryEntry[], showSources: boolean): NormalizedRequest => {
+      const target = showSources ? sources.flatMap(summary => [
+        { participant: 'Context Manager', content: [{ type: 'text' as const, text: `[CM] Recall memory ${summary.id}.` }] },
+        { participant, content: this.summaryAnswerContent(summary) },
+      ]) : llmMessages.slice(targetStartIndex, targetEndIndex);
+      const instruction = showSources
+        ? this.applyIdentityReminder(sources.every(s => s.witnessed)
+          ? formatWitnessedMergeInstruction(targetLevel, sources[0].level, targetTokens)
+          : formatMergeInstruction(targetLevel, sources[0].level, targetTokens)) + mergeInstructionSuffix
+        : mergeInstructionText;
+      const selected = [
+        ...llmMessages.slice(0, recallStartIndex),
+        ...retained.flatMap(summary => [
+          { participant: 'Context Manager', content: [{ type: 'text' as const, text: `[CM] Recall memory ${summary.id}.` }] },
+          { participant, content: this.summaryAnswerContent(summary) },
+        ]),
+        ...llmMessages.slice(recallEndIndex, targetStartIndex),
+        ...target,
+        { participant: 'Context Manager', content: [{ type: 'text' as const, text: instruction }] },
+      ];
+      const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(selected)));
+      const { mintMessages, mintSeamed } = this.finishMintMessages(cleaned, retained, retained.length < priorSummariesAll.length);
+      const { cacheTtl: _previousSeams, ...base } = request;
+      const rebuilt = { ...base, messages: mintMessages, ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}) };
+      return toollessEscalation ? withoutToolsParam(rebuilt) : rebuilt;
     };
 
     // Escalation past the no-tools sentence: if the line-carrying retry has
@@ -7896,35 +8378,78 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
     }
 
+    this.markArchivalMemoryRequest(dispatchRequest, 'merge', archivalLineage);
     const callStart = Date.now();
     let logResponse: string | undefined;
     let logError: string | undefined;
     let logNewSummaryId: string | undefined;
 
+    let acceptedRequest = dispatchRequest;
+    let acceptedRoute: NonNullable<SummaryEntry['provenance']>['archivalCyberPolicyFallback'];
+    let acceptedAttemptOwner: (() => void) | undefined;
+    let carrierDegraded = false;
+    const assertDispatchOwner = (): void => {
+      if (!this.isCompressionBranchCurrent(sourceBranch)) {
+        throw Object.assign(new Error('Merge dispatch crossed a branch boundary'), { name: 'CompressionBranchDiscard' });
+      }
+      this.assertCurrentIfArchival();
+    };
     try {
       let response: NormalizedResponse;
-      // The request the transport ACCEPTED — `dispatchRequest` unless the
-      // carrier fallback below fires, in which case the transport refused
-      // those bytes and the stripped copy is what authored the merge. See
-      // the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
-      let acceptedRequest = dispatchRequest;
-      try {
-        response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
-      } catch (error) {
-        // Same degraded-mode fallback as the L1 ladder: transport rejected
-        // the carrier blocks → retry once text-only, loudly.
-        if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
-        console.error(
-          `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
-            `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
-        );
-        logCompressionCall({
-          event: 'compression:carrier-transport-fallback',
-          operation: `merge_l${targetLevel}`,
-          metadata: { error: String(error).slice(0, 300) },
-        });
-        acceptedRequest = stripReasoningFromRequest(dispatchRequest);
-        response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
+      for (;;) {
+        if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+        this.assertCurrentIfArchival();
+        this.markArchivalMemoryRequest(acceptedRequest, 'merge', archivalLineage);
+        try {
+          const attempt = await this.attemptNativeMemory(ctx, acceptedRequest, 'merge', archivalLineage, assertDispatchOwner);
+          response = attempt.response;
+          acceptedRequest = attempt.request;
+          acceptedRoute = attempt.route;
+          acceptedAttemptOwner = attempt.assertOwner;
+        } catch (error) {
+          if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          this.assertCurrentIfArchival();
+          if (error instanceof ArchivalCyberPolicyFallbackHalt || error instanceof ArchivalNativeOwnerDiscard) throw error;
+          const providerError = error as { type?: unknown; retryable?: unknown } | null;
+          // Safety normalization outranks prose/status-based carrier fallback.
+          if (providerError?.type === 'safety' && providerError.retryable === false) throw error;
+          if (archivalLineage && isArchivalLocalCap(error)) {
+            const requestHash = sha256Json(acceptedRequest);
+            const disposition = keptPriorSummaries.length ? 'drop_oldest_optional_recall'
+              : !sourceRecollections ? 'all_source_recollections' : 'mandatory_floor';
+            logCompressionCall({ event: 'compression:admission-refit', operation: `merge_l${targetLevel}`, metadata: {
+              outcome: 'admission_rejected', disposition, request_hash: requestHash,
+              source_ids: sourceIds, recall_ids: keptPriorSummaries.map(s => s.id),
+              source_level_shown: sourceLevelShown, error_type: ARCHIVAL_MEMORY_LOCAL_CAP_CODE,
+            } });
+            if (keptPriorSummaries.length) {
+              keptPriorSummaries = keptPriorSummaries.slice(1);
+              mergeRecallTokens = this.capRecallPairs(keptPriorSummaries, Infinity).keptTokens;
+            } else if (!sourceRecollections) {
+              // Same selected native sources, now each shown in its own voice.
+              // This is a budget representation choice, never a model refusal.
+              sourceRecollections = true;
+              representationDisposition = 'budget_all_source_recollections';
+              sourceLevelShown = sources[0].level;
+            } else {
+              throw new MergeDispositionRejection(targetLevel, 'admission_rejected', requestHash,
+                undefined, ARCHIVAL_MEMORY_LOCAL_CAP_CODE);
+            }
+            acceptedRequest = buildMergeRequest(keptPriorSummaries, sourceRecollections);
+            if (carrierDegraded) acceptedRequest = stripReasoningFromRequest(acceptedRequest);
+            continue;
+          }
+          if (carrierDegraded || !isCarrierTransportRejection(error, archivalLineage) || !requestCarriesReasoning(acceptedRequest)) throw error;
+          const safeError = archivalLineage ? 'reasoning carrier rejected' : String(error).slice(0, 300);
+          console.error(`[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge — retrying ONCE with text-only recall pairs (degraded mode)`);
+          logCompressionCall({ event: 'compression:carrier-transport-fallback', operation: `merge_l${targetLevel}`, metadata: { error: safeError } });
+          carrierDegraded = true;
+          acceptedRequest = stripReasoningFromRequest(acceptedRequest);
+          continue;
+        }
+        if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+        this.assertCurrentIfArchival();
+        break;
       }
       // Request identity — persisted on the authored summary (provenance) and
       // stamped on every failure receipt, so any parent can be traced back to
@@ -7934,6 +8459,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the accepted request known.
       const requestHash = sha256Json(acceptedRequest);
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      this.assertCurrentIfArchival();
 
       // Terminal-disposition gate (2026-08-01): a consolidation may become
       // canonical only after a COMPLETE accepted disposition — `end_turn` +
@@ -8000,6 +8526,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       };
 
       const sourceLevel = (targetLevel - 1) as 0 | 1 | 2;
+      acceptedAttemptOwner?.();
       const newEntry: SummaryEntry = {
         id: `L${targetLevel}-${this.nextSummaryIdCounter()}`,
         level: targetLevel,
@@ -8021,7 +8548,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         provenance: {
           stopReason: 'end_turn',
           requestHash,
-          model: this.requireCompressionModel(),
+          model: archivalLineage && this.config.archivalCyberPolicyFallbackModel ? response.details?.model.actual ?? acceptedRequest.config.model : this.requireCompressionModel(),
+          ...(acceptedRoute ? { archivalCyberPolicyFallback: acceptedRoute } : {}),
         },
       };
       logNewSummaryId = newEntry.id;
@@ -8034,7 +8562,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // Provenance the auditor can READ: store the accepted request under the
       // hash the entry carries, before the entry itself lands.
-      this.persistMintPreimage(ctx, acceptedRequest, requestHash);
+      acceptedAttemptOwner?.();
+      this.persistMintPreimage(ctx, acceptedRequest, requestHash, archivalLineage);
+      acceptedAttemptOwner?.();
 
       // Append the new merged entry first, then mark sources. Persist each
       // mergedInto edit individually so chronicle reflects the same shape as
@@ -8050,24 +8580,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Check if this merge triggers a further merge
       this.checkMergeThreshold();
     } catch (error) {
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      this.assertCurrentIfArchival();
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.
+      logError = archivalLineage
+        ? `Archival merge dispatch failed [${sha256Json(error instanceof Error ? error.message : String(error)).slice(0, 16)}]; work remains resumable`
+        : error instanceof Error ? error.message : String(error);
       if (!(error instanceof MergeDispositionRejection)) {
-        console.error(`Failed to merge summaries into L${targetLevel}:`, error);
+        console.error(`Failed to merge summaries into L${targetLevel}:`, archivalLineage ? logError : error);
       }
-      logError = error instanceof Error ? error.message : String(error);
       throw error;
     } finally {
-      logCompressionCall({
+      if (this.canLogCompressionResult(sourceBranch)) logCompressionCall({
         operation: `merge_l${targetLevel}`,
         // The DISPATCHED bytes — see the twin note at the compress_l1 site
         // for why this must not re-read ctx.systemPrompt after the await.
-        // `dispatchRequest` is what went on the wire: `request` itself, or
-        // its tools-less escalation, which drops the tools param and carries
-        // `system` through by spread.
-        system: dispatchRequest.system ? summarizeTelemetryText(dispatchRequest.system) : null,
-        messages: summarizeTelemetryMessages(cleaned),
+        // Local representation fitting and genuine carrier fallback both
+        // update acceptedRequest; telemetry names those actual final bytes.
+        system: acceptedRequest.system ? summarizeTelemetryText(acceptedRequest.system) : null,
+        messages: summarizeTelemetryMessages(acceptedRequest.messages),
         metadata: {
+          request_hash: sha256Json(acceptedRequest),
+          representation_disposition: representationDisposition,
+          recall_ids: keptPriorSummaries.map(s => s.id),
+          prior_summary_tokens: mergeRecallTokens,
           target_level: targetLevel,
           source_ids: sourceIds,
           source_level: sources[0]?.level ?? null,
@@ -10285,8 +10822,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * over pure-witness chunks in multi-resident channels).
    */
   protected applyIdentityReminder(instruction: string): string {
-    const reminder = this.config.identityReminder?.trim();
-    return reminder ? `${instruction}\n\n${reminder}` : instruction;
+    const reminder = this.config.identityReminder;
+    return reminder?.trim() ? `${instruction}\n\n${reminder}` : instruction;
   }
 
   protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
@@ -10487,6 +11024,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   async generateTransitionSummary(ctx: StrategyContext): Promise<string> {
     const sourceBranch = this.requireLoadedBranch('generateTransitionSummary');
+    this.assertCurrentIfArchival();
     if (!ctx.membrane) {
       throw new Error('No membrane instance for transition summary generation');
     }
@@ -10526,21 +11064,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       headContent,
       topSummaries ? `\nHigher-level summaries:\n${topSummaries}` : '',
       '',
-      'Write a concise transition summary.',
+      this.applyIdentityReminder('Write a concise transition summary.'),
     ].join('\n');
 
     const request: NormalizedRequest = {
       messages: [{ participant: 'Context Manager', content: [{ type: 'text', text: instruction }] }],
-      system: 'You are forming a transition summary between conversation topics. Write concisely.',
+      system: ctx.systemPrompt ?? 'You are forming a transition summary between conversation topics. Write concisely.',
       config: {
         model: this.requireCompressionModel(),
         maxTokens: 1500,
       },
     };
 
-    const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+    const archival = this.chunkRecords.some(record => record.archival);
+    this.markArchivalMemoryRequest(request, 'transition', archival);
+    const attempt = await this.attemptNativeMemory(ctx, request, 'transition', archival, () => {
+      if (!this.isCompressionBranchCurrent(sourceBranch)) {
+        throw new Error('Transition summary crossed a branch generation; reinitialize before retrying');
+      }
+      this.assertCurrentIfArchival();
+    });
     if (!this.isCompressionBranchCurrent(sourceBranch)) {
       throw new Error('Transition summary crossed a branch generation; reinitialize before retrying');
+    }
+    this.assertCurrentIfArchival();
+    attempt.assertOwner?.();
+    const { response, request: acceptedRequest, route } = attempt;
+    if (archival && this.config.archivalCyberPolicyFallbackModel) {
+      const requestHash = sha256Json(acceptedRequest);
+      this.persistMintPreimage(ctx, acceptedRequest, requestHash, true);
+      attempt.assertOwner?.();
+      logCompressionCall({ event: 'compression:transition-accepted', operation: 'transition', metadata: {
+        request_hash: requestHash, requested_model: acceptedRequest.config.model, model: response.details.model.actual,
+        ...(route ? { archivalCyberPolicyFallback: route } : {}),
+      } });
     }
     // Text-only on purpose: summarizer scratch thinking is not agent history
     return response.content
@@ -10594,6 +11151,97 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return out;
   }
 
+  /** Check durable intent too: an ordinary mirror can predate another owner's seal. */
+  protected assertCurrentIfArchival(): void {
+    const batches = this.store?.getStateJson(this.archivalBatchesStateId);
+    if (this.chunkRecords.some(record => record.archival) || (Array.isArray(batches) && batches.length > 0)) {
+      this.assertArchivalStateCurrent();
+    }
+  }
+
+  /** Fail closed if another same-namespace owner advanced native membership or merge debt. */
+  protected assertArchivalStateCurrent(): ChunkRecord[] {
+    const persisted = this.store?.getStateJson(this.chunksStateId);
+    const persistedSummaries = this.store?.getStateJson(this.summariesStateId);
+    const persistedQueue = this.store?.getStateJson(this.mergeQueueStateId);
+    const persistedQuarantine = this.store?.getStateJson(this.mergeQuarantineStateId);
+    const records = Array.isArray(persisted) ? persisted as ChunkRecord[] : [];
+    const summaries = Array.isArray(persistedSummaries) ? persistedSummaries as SummaryEntry[] : [];
+    let quarantineGenerationsCurrent = true;
+    if (this.config.archivalCyberPolicyFallbackModel === 'gpt-daybreak-blue-latest') {
+      const current = this.readCompressionQuarantineProjection();
+      quarantineGenerationsCurrent = current.size === this.compressionRefusalQuarantine.size;
+      if (quarantineGenerationsCurrent) for (const [key, active] of current) {
+        if (this.compressionRefusalQuarantine.get(key)?.generationId !== active.generationId) {
+          quarantineGenerationsCurrent = false;
+          break;
+        }
+      }
+    }
+    if (!quarantineGenerationsCurrent ||
+        !isDeepStrictEqual(Array.isArray(persistedQueue) ? persistedQueue : [], this.mergeQueue) ||
+        !isDeepStrictEqual(Array.isArray(persistedQuarantine) ? persistedQuarantine : [], [...this.mergeQuarantine.values()]) ||
+        records.length !== this.chunkRecords.length || summaries.length !== this.summaries.length ||
+        records.some((record, i) => record.id !== this.chunkRecords[i].id || record.compressed !== this.chunkRecords[i].compressed || record.summaryId !== this.chunkRecords[i].summaryId || record.archival !== this.chunkRecords[i].archival || !Array.isArray(record.sourceIds) || record.sourceIds.length !== this.chunkRecords[i].sourceIds.length || record.sourceIds.some((id, j) => id !== this.chunkRecords[i].sourceIds[j])) ||
+        summaries.some((summary, i) => summary.id !== this.summaries[i].id || summary.mergedInto !== this.summaries[i].mergedInto || !Array.isArray(summary.sourceIds) || summary.sourceIds.length !== this.summaries[i].sourceIds.length || summary.sourceIds.some((id, j) => id !== this.summaries[i].sourceIds[j]))) {
+      throw new Error('Stale archival strategy state; use one owner and close/reopen before sealing or committing');
+    }
+    return records;
+  }
+
+  /** Explicit, bounded import finalization; no profile mutation or inference. */
+  finalizeArchivalBatch(ctx: StrategyContext, throughId: MessageId): void {
+    this.requireBranchMutation('finalizeArchivalBatch');
+    if (!this.chunkPersistenceEnabled || !this.config.hierarchical || this.config.auditOnly) {
+      throw new Error('Archival finalization requires writable native hierarchical chunk persistence');
+    }
+    if (this.pendingCompression) throw new Error('Cannot seal an archival batch during inference');
+    const persisted = this.assertArchivalStateCurrent();
+    const messages = ctx.messageStore.getAll();
+    const end = messages.findIndex(message => message.id === throughId);
+    if (end < 0) throw new Error('Archival endpoint is not in the current message view');
+    const blocked = this.holdBlockedIds(ctx.messageStore);
+    const pinned = this.pinnedPositions(messages);
+    for (let i = 0; i <= end; i++) {
+      if (blocked?.has(messages[i].id) || pinned.has(i)) {
+        throw new Error('Archival batch intersects a held or pinned message');
+      }
+    }
+    if (this.lastMessageContainsToolUse([messages[end]])) {
+      throw new Error('Archival endpoint cannot split an active tool-use/result pair; import inert linked transcript data');
+    }
+    const selected = new Set(messages.slice(0, end + 1).map(message => message.id));
+    for (const record of this.chunkRecords) {
+      if (record.sourceIds.some(id => selected.has(id)) && !record.sourceIds.every(id => selected.has(id))) {
+        throw new Error('Archival endpoint cuts an existing native chunk; choose its boundary or rebuild a new candidate');
+      }
+    }
+    // Persist intent BEFORE writing boundaries. Reopen retries this endpoint,
+    // including a partial tail whose record had not landed when the writer died.
+    if (this.store) {
+      const batches = this.store.getStateJson(this.archivalBatchesStateId);
+      if (!Array.isArray(batches)) {
+        this.store.registerState({ id: this.archivalBatchesStateId, strategy: 'append_log', deltaSnapshotEvery: 50, fullSnapshotEvery: 10 });
+      }
+      if (!Array.isArray(batches) || batches[batches.length - 1]?.throughId !== throughId) {
+        this.store.appendToStateJson(this.archivalBatchesStateId, { throughId });
+        this.store.sync();
+      }
+    }
+    if (Array.isArray(persisted)) {
+      for (let i = 0; i < persisted.length; i++) {
+        const record = persisted[i] as ChunkRecord;
+        if (!record.archival && record.sourceIds.every(id => selected.has(id))) {
+          record.archival = true;
+          this.store!.editStateItem(this.chunksStateId, i, Buffer.from(JSON.stringify(record)));
+          const local = this.chunkRecords.find(item => item.id === record.id);
+          if (local) local.archival = true;
+        }
+      }
+    }
+    this.rebuildChunks(ctx.messageStore, false, throughId);
+  }
+
   /**
    * Rebuild the chunk list: persisted records own the past; the running-sum
    * chunker only extends at the frontier, and a chunk is only ever created
@@ -10602,7 +11250,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * minted a new near-duplicate L1 per rebuild while the tail grew (the
    * prefix-generation families found fleet-wide in the 2026-07 audit).
    */
-  protected rebuildChunks(store: MessageStoreView, dryRun = false): void {
+  protected rebuildChunks(store: MessageStoreView, dryRun = false, archivalThroughId?: MessageId, recordsOnly = false): void {
     this.chunks = [];
     this.compressionQueue = [];
 
@@ -10634,6 +11282,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         summaryId: rec.summaryId,
         phaseType: rec.phaseType,
         recordId: rec.id,
+        archival: rec.archival,
       };
       this.chunks.push(chunk);
     }
@@ -10678,8 +11327,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // are not the resident's, and a record written here would be compressed
     // by the resident at its next boot.
     if (this.config.auditOnly) return;
-    const messagesToChunk = this.getCompressibleMessages(store)
-      .filter(m => !consumed.has(m.id));
+    const archival = archivalThroughId !== undefined;
+    const frontier = recordsOnly ? [] : archival
+      ? listing.slice(0, listing.findIndex(message => message.id === archivalThroughId) + 1)
+      : this.getCompressibleMessages(store);
+    const messagesToChunk = frontier.filter(m => !consumed.has(m.id));
     const livePosition = new Map<string, number>();
     store.getAll().forEach((message, index) => livePosition.set(message.id, index));
 
@@ -10698,6 +11350,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         messages: [...currentChunk],
         tokens: currentTokens,
         compressed: false,
+        ...(archival ? { archival: true } : {}),
       };
       // Persist the boundary the moment it closes — from here on this
       // span is owned and never re-keyed by config drift or restarts.
@@ -10706,6 +11359,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           id: `c-${this.chunkIdCounter++}`,
           sourceIds: chunk.messages.map(m => m.id),
           compressed: false,
+          ...(archival ? { archival: true } : {}),
         };
         this.appendChunkRecord(record);
         chunk.recordId = record.id;
@@ -10758,7 +11412,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       const shouldClose =
         currentTokens >= this.config.targetChunkTokens &&
-        currentChunk.length >= 4;
+        (archival || currentChunk.length >= 4);
 
       // Don't close a chunk on a message containing a tool_use block —
       // the matching tool_result lives in the immediately-following user
@@ -10776,8 +11430,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // NOTE: no trailing-partial chunk. An unclosed chunk is not a chunk —
-    // it compresses only after the running sum closes it.
+    // Only an explicit archival endpoint closes a partial tail. Ordinary live
+    // ingress still waits for its target, never minting growing-prefix L1s.
+    if (archival && currentChunk.length > 0) closeCurrent(messagesToChunk.length);
 
     // ---- 4. L1 holdback: keep the newest X closed chunks out of the
     // speculative queue (default 1). The chunk at the live edge is the one
@@ -10794,6 +11449,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionQueue = this.compressionQueue.filter((idx) => {
         if (idx < cutoff) return true;
         const ch = this.chunks[idx];
+        if (ch?.archival) return true;
         const lastId = ch?.messages[ch.messages.length - 1]?.id;
         return lastId !== undefined && this._demandedL1Chunks.has(lastId);
       });

@@ -7,6 +7,11 @@ import type {
   PendingWork,
 } from './context.js';
 
+/** Safe pre-auth final-body admission refusal, preserved by Membrane's error bridge.
+ * Only this code plus context_length/retryable:false invites archival local fitting.
+ * It is not a provider context error or a measured-token claim. */
+export const ARCHIVAL_MEMORY_LOCAL_CAP_CODE = 'archival_memory_local_cap';
+
 /**
  * Read-only view of the message store for strategies.
  */
@@ -151,6 +156,13 @@ export interface ContextStrategy {
    * Called by application to trigger compression, indexing, etc.
    */
   tick?(ctx: StrategyContext): Promise<void>;
+
+  /**
+   * Explicitly seal archival history through this message (inclusive), even
+   * inside head/recent windows or below the ordinary chunk target. Does not
+   * change the live profile or run inference. Boundaries must survive reopen.
+   */
+  finalizeArchivalBatch?(ctx: StrategyContext, throughId: MessageId): void;
 
   /**
    * React to new messages.
@@ -790,6 +802,9 @@ export interface AutobiographicalConfig {
   summaryParticipant?: string;
   /** Model to use for compression (defaults to claude-sonnet) */
   compressionModel?: string;
+  /** One explicit native archival cyber_policy attempt; absent means no model fallback.
+   * Only gpt-6.1-sol archival requests may route to this approved exact model. */
+  archivalCyberPolicyFallbackModel?: 'gpt-daybreak-blue-latest';
   /**
    * Hard cap on `max_tokens` for compression requests. The summarizer asks for
    * `max(16000, targetChunkTokens * 1.5)` so folds are not truncated mid-memory,
@@ -1311,7 +1326,9 @@ export interface AutobiographicalConfig {
    * yet. Fleets that deploy from checkout would otherwise have every
    * resident start writing preimages on the next pull, so turning it on is a
    * deliberate act with an eye on store size. Absent config means off: only
-   * an explicit `true` enables it.
+   * an explicit `true` enables it for ordinary live mints. Explicit native
+   * archival L1/merge ownership always preserves the accepted request preimage
+   * without changing this configuration or the hashed staging/runtime profile.
    *
    * Writing is best-effort even when true: a store that refuses the write is
    * reported on stderr and the mint proceeds without a preimage.
@@ -1421,8 +1438,9 @@ export interface SummaryEntry {
    * pre-gate entry, verify against host-harness logs via content match;
    * present → `requestHash` keys the request that authored this summary.
    *
-   * That key is readable, not merely verifiable, WHERE the host opted into
-   * preimage persistence (`persistMintPreimages: true`, off by default): the
+   * That key is readable, not merely verifiable, for explicit native archival
+   * L1/merge mints or WHERE the host opted into ordinary live preimage
+   * persistence (`persistMintPreimages: true`, off by default): the
    * authoring request is then retrievable by this very hash —
    * `getMintRequestByHash(store, requestHash)`, src/mint-preimage.ts — so
    * audit no longer depends on a host-side llm-calls log surviving. It is
@@ -1446,8 +1464,10 @@ export interface SummaryEntry {
      * hash keys, because they are what the model actually read.
      */
     requestHash: string;
-    /** Compression model that authored this summary. */
+    /** Actual accepted served model that authored this summary. */
     model?: string;
+    /** Routing event for this authoring call only, never inherited from children. */
+    archivalCyberPolicyFallback?: { primaryModel: 'gpt-6.1-sol'; reason: 'cyber_policy' };
   };
 }
 

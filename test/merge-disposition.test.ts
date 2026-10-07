@@ -289,6 +289,64 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
+  it('normalized nonretryable safety escapes the real ordinary merge once without carrier fallback or debt mutation', async () => {
+    // The prose/status would qualify for legacy carrier fallback; normalized
+    // safety must still win. Every source and optional recall is synthetic.
+    const safety = Object.assign(new Error('invalid_request: thinking carrier rejected'), {
+      type: 'safety', retryable: false, httpStatus: 400,
+    });
+    const mock = scripted([{ error: safety }, { stop: 'end_turn', text: 'Must never be accepted.' }]);
+    const fx = await fixture(mock.membrane, { mergeAttemptLimit: 1 }, freshPath(), false);
+    try {
+      const raw = fx.manager.getAllMessages();
+      for (let i = 0; i < 3; i++) fx.strategy.seed({
+        id: `L1-policy-${i}`, level: 1, content: `Disposable recollection ${i}.`, tokens: 20,
+        sourceLevel: 0, sourceIds: [raw[i * 2].id, raw[i * 2 + 1].id],
+        sourceRange: { first: raw[i * 2].id, last: raw[i * 2 + 1].id }, created: i + 1,
+        ...(i === 0 ? { responseContent: [{ type: 'thinking' as const, thinking: 'Fixture carrier.', signature: 'fixture-only' }, t('Disposable recall.')] } : {}),
+      });
+      fx.strategy.qMerge(2, ['L1-policy-1', 'L1-policy-2']);
+      const queue = structuredClone(fx.strategy.mergeQueueView());
+      const summaries = structuredClone(fx.strategy.summariesView());
+      const persistedQueue = structuredClone(storedMergeQueue(fx.manager));
+      const quarantine = structuredClone(storedMergeQuarantine(fx.manager));
+      const blobs = fx.manager.getStore().stats().blobCount;
+      await assert.rejects(fx.manager.tick(), error => {
+        assert.equal(error, safety, 'the exact provider error reaches the manager caller');
+        assert.equal(safety.type, 'safety'); assert.equal(safety.retryable, false); assert.equal(safety.httpStatus, 400);
+        return true;
+      });
+      assert.equal(mock.calls.length, 1, 'no carrier fallback or second provider dispatch');
+      assert.ok(JSON.stringify(mock.calls[0]).includes('fixture-only'), 'reasoning fallback was actually eligible');
+      assert.deepEqual(fx.strategy.mergeQueueView(), queue, 'queued source set and attempt counters unchanged');
+      assert.deepEqual(storedMergeQueue(fx.manager), persistedQueue);
+      assert.deepEqual(fx.strategy.summariesView(), summaries, 'no parent or changed source links');
+      assert.deepEqual(storedMergeQuarantine(fx.manager), quarantine);
+      assert.equal(fx.strategy.getMergeQuarantineStatus().count, 0);
+      assert.deepEqual(fx.manager.getAllMessages(), raw);
+      assert.equal(fx.manager.getStore().stats().blobCount, blobs, 'no accepted mint/preimage');
+      assert.equal(fx.strategy.getProgressSnapshot().mergeQueueLength, 1, 'pending debt remains available');
+    } finally { fx.manager.close(); }
+  });
+
+  it('non-safety nonretryable provider errors retain bounded accounting and quarantine', async () => {
+    const error = Object.assign(new Error('Disposable context rejection.'), { type: 'context_length', retryable: false });
+    const mock = scripted([{ error }]);
+    const fx = await fixture(mock.membrane, { mergeAttemptLimit: 2 });
+    try {
+      const summaries = structuredClone(fx.strategy.summariesView());
+      await fx.manager.tick();
+      assert.equal(mock.calls.length, 1); assert.equal(storedMergeQueue(fx.manager)[0]?.attempts, 1);
+      assert.equal(fx.strategy.getMergeQuarantineStatus().count, 0);
+      await fx.manager.tick();
+      assert.equal(mock.calls.length, 2); assert.equal(storedMergeQueue(fx.manager).length, 0);
+      assert.equal(fx.strategy.getMergeQuarantineStatus().count, 1);
+      assert.equal(fx.strategy.getMergeQuarantineStatus().records[0].lastOutcome, 'provider_error');
+      assert.deepEqual(fx.strategy.summariesView(), summaries, 'rejected operations never parent sources');
+      await fx.manager.tick(); assert.equal(mock.calls.length, 2, 'bounded debt is not automatically redispatched');
+    } finally { fx.manager.close(); }
+  });
+
   it('tool_use rejection appends the no-tools line on the retry — and only on the retry', async () => {
     // The lena 2026-08-04 wedge: a summarizer whose recent spans are
     // tool-heavy answers the merge prompt with a `think` call carrying the
